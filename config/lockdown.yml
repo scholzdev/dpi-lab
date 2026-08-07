@@ -1,0 +1,5 @@
+# Auto-populated by --lockdown: ip -> unix-epoch expiry for deterministic
+# pf-level blocks (see src/lockdown.rs). Not meant to be hand-edited - dpi-lab
+# writes entries here itself whenever a match fires with --lockdown on, and
+# prunes expired ones on both read and write. Empty by default.
+{}

@@ -13,7 +13,10 @@
 // [detect] hit, connect out to confirm before trusting the entropy heuristic) is
 // scoped to config/probe_targets.yml - own lab hosts only. --cannon injects a
 // plaintext HTTP response (marker string and/or redirect) between two hosts on
-// config/cannon.yml's allow-list - own lab hosts only.
+// config/cannon.yml's allow-list - own lab hosts only. --lockdown makes any
+// IP/SNI/JA3/signature match a hard, TTL-bounded macOS pfctl block (kernel
+// drops every subsequent packet, not just a raced RST) - persists to
+// config/lockdown.yml the same way escalated_ip.yml does.
 // (no arg = list interfaces)
 mod cannon;
 mod classify;
@@ -21,6 +24,7 @@ mod config;
 mod detect;
 mod engine;
 mod inject;
+mod lockdown;
 mod probe;
 mod reassembly;
 mod redirect;
@@ -53,6 +57,7 @@ fn print_summary_and_exit(stats: &BlockStats) {
         println!("  {:<10} {total}", "total");
     }
     throttle::clear_all();
+    lockdown::clear_all();
     std::process::exit(0);
 }
 
@@ -88,6 +93,9 @@ fn main() {
     // Own-lab-to-own-lab HTTP response injection (Great-Cannon-style); allow-list
     // enforced in config/cannon.yml, this flag only turns the mechanism on at all.
     let cannon_enabled = args.iter().any(|a| a == "--cannon");
+    // Deterministic kernel-level block on any IP/SNI/JA3/signature match -
+    // unlike --inject's raced RST, this can't lose the race.
+    let lockdown_enabled = args.iter().any(|a| a == "--lockdown");
     let trace = args.iter().any(|a| a == "--trace");
 
     let config_dir = Path::new("config");
@@ -119,6 +127,20 @@ fn main() {
         config::load_expiry_map(&config_dir.join("throttle.yml")).into_iter().map(|(ip, kbit)| (ip, kbit as u32)).collect();
     throttle::apply_all(&throttle_entries);
 
+    // lockdown.yml persists ip -> unix-epoch expiry, same shape/reasoning as
+    // escalated_ip.yml. Re-arm the pf anchor at startup so a restart (crash
+    // or clean) restores exactly the still-valid set, not a stale one.
+    let lockdown_ips: Vec<(String, std::time::Duration)> =
+        config::load_expiry_map(&config_dir.join("lockdown.yml")).into_iter().filter_map(|(ip, exp)| {
+            (exp > now_epoch).then(|| (ip, std::time::Duration::from_secs(exp - now_epoch)))
+        }).collect();
+    if lockdown_enabled {
+        let ips: Vec<String> = lockdown_ips.iter().map(|(ip, _)| ip.clone()).collect();
+        if let Err(e) = lockdown::apply_all(&ips) {
+            eprintln!("[lockdown] failed to restore firewall rules at startup: {e}");
+        }
+    }
+
     let block_stats: BlockStats = Arc::new(Mutex::new(HashMap::new()));
     let stats_for_handler = block_stats.clone();
     ctrlc::set_handler(move || print_summary_and_exit(&stats_for_handler)).expect("failed to set Ctrl-C handler");
@@ -135,6 +157,8 @@ fn main() {
         probe_targets,
         cannon,
         cannon_enabled,
+        lockdown_ips,
+        lockdown_enabled,
         trace,
         block_stats,
     )
