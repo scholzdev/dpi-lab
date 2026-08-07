@@ -72,6 +72,7 @@ fn build_response(src: Ipv4Addr, src_port: u16, dst: Ipv4Addr, dst_port: u16, se
 /// `server_seq` is the next byte the real server would send (from the
 /// reverse flow's tracked ISN + bytes delivered so far); `client_seq_after`
 /// is the client's next unsent byte (what the server would ack).
+#[allow(clippy::too_many_arguments)]
 pub fn inject_response(
     tx: &mut pnet::transport::TransportSender,
     server: Ipv4Addr,

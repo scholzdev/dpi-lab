@@ -5,17 +5,18 @@ to study and replicate mechanisms documented in Great Firewall research:
 keyword/SNI/JA3 filtering, TCP RST injection, DNS response spoofing,
 entropy-based detection of obfuscated proxy protocols, allow-list-scoped
 active probing, Great-Cannon-style HTTP response injection, adaptive
-TTL-bounded IP escalation, and local bandwidth throttling. Built as a
-portfolio piece for network security/penetration testing applications.
+TTL-bounded IP escalation, local bandwidth throttling, and deterministic
+pf-level lockdown. Built as a portfolio piece for network
+security/penetration testing applications.
 
 ## Ethics / scope
 
 Everything here was developed and tested against **traffic I generate myself**:
 a two-VM lab, my own Raspberry Pi, and my own domain (`florianscholz.dev`). RST
-injection, DNS redirect, throttling, active probing, and response injection
-are all off by default and only ever fired at connections/hosts I control -
-active probing and response injection additionally only ever act between
-hosts on an explicit allow-list (`config/probe_targets.yml`,
+injection, DNS redirect, throttling, active probing, response injection, and
+lockdown are all off by default and only ever fired at connections/hosts I
+control - active probing and response injection additionally only ever act
+between hosts on an explicit allow-list (`config/probe_targets.yml`,
 `config/cannon.yml`), enforced in code, and response injection's payload is
 always inert (a marker string and/or a redirect to another host I own, never
 executable content). This is not deployed against, and should not be run
@@ -24,19 +25,19 @@ full threat model.
 
 **Disclaimer.** This is educational/research code, licensed under MIT (see
 `LICENSE`) with no warranty. `--inject`, `--redirect-dns`, `--throttle`,
-`--cannon`, and active probing forge packets, spoof DNS, modify real firewall
-state, inject response content, and open outbound connections - running any
-of them against networks, hosts, or traffic you don't own or have explicit
-authorization to test almost certainly violates the law (e.g. wire fraud /
-unauthorized access statutes) and, separately, your ISP's or employer's
-acceptable-use policy. That's on you, not this code. Point it only at
-infrastructure you own or are explicitly authorized to test.
+`--cannon`, `--lockdown`, and active probing forge packets, spoof DNS, modify
+real firewall state, inject response content, and open outbound connections -
+running any of them against networks, hosts, or traffic you don't own or have
+explicit authorization to test almost certainly violates the law (e.g. wire
+fraud / unauthorized access statutes) and, separately, your ISP's or
+employer's acceptable-use policy. That's on you, not this code. Point it only
+at infrastructure you own or are explicitly authorized to test.
 
 ## Build & run
 
 ```bash
 cargo build
-cargo test                              # 44 unit tests, no network/root needed
+cargo test                              # 47 unit tests, no network/root needed
 sudo ./target/debug/dpi-lab <interface> [flags]
 ```
 
@@ -49,6 +50,7 @@ to actually capture). Key flags:
 | `--inject-on-detect` | also fire on an entropy-based detect (separate opt-in - heuristic, not deterministic) |
 | `--redirect-dns` | spoof DNS A/AAAA responses per `config/redirect.yml` |
 | `--cannon` | inject a plaintext HTTP response per `config/cannon.yml` (own-lab hosts only) |
+| `--lockdown` | any IP/SNI/JA3/signature/detect match hard-blocks that source IP at the pf level (deterministic, can't lose a race like `--inject`) |
 | `--trace` | print every raw TCP/UDP packet (flood); off by default, only classification/block events print |
 | `--block-sni/-ja3/-ip/-sig <value>` | repeatable, adds one rule on top of the matching `config/*.yml` |
 
@@ -56,10 +58,12 @@ Block lists (`config/{sni,ja3,ip,signatures}.yml`), the DNS redirect map
 (`config/redirect.yml`), throttle rates (`config/throttle.yml`), the
 active-probing allow-list (`config/probe_targets.yml`), and the response-
 injection allow-list + payload (`config/cannon.yml`) are all plain YAML - own
-lab hosts only, edit the file, no rebuild needed. Auto-escalated IPs persist to
-`config/escalated_ip.yml` with a TTL and survive restarts; already-expired
-entries are dropped automatically. Ctrl-C prints a block-event summary and
-clears any throttle state before exiting.
+lab hosts only, edit the file, no rebuild needed. Auto-escalated IPs
+(`config/escalated_ip.yml`) and lockdown IPs (`config/lockdown.yml`, written
+by dpi-lab itself, not hand-edited) both persist with a TTL and survive
+restarts; already-expired entries are dropped automatically. Ctrl-C prints a
+block-event summary and clears any throttle/lockdown firewall state before
+exiting.
 
 ## Reproducing the results in writeup.md
 
@@ -82,6 +86,7 @@ sudo ./scripts/repro_sig_block.sh     # live signature-match -> RST block, needs
 | `src/throttle.rs` | macOS `pfctl`/`dnctl` bandwidth throttling - the one inline (non-spoofing) mechanism |
 | `src/probe.rs` | active probing (SOCKS5/HTTP-CONNECT handshake) against allow-listed hosts only |
 | `src/cannon.rs` | Great-Cannon-style HTTP response injection, allow-listed pairs only |
+| `src/lockdown.rs` | deterministic pf-level IP block - the other inline (non-spoofing) mechanism, alongside throttle.rs |
 | `src/timing.rs` | packet timing/size statistics |
 | `src/config.rs` | YAML block-list/map loading, escalation-expiry persistence |
 

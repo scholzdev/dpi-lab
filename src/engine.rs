@@ -5,6 +5,7 @@ use crate::classify::{ja3, parse_dns_query_full, parse_client_hello, Signatures}
 use crate::config::CannonConfig;
 use crate::detect::{classify_first_segment, TLS_LIKE_PORTS};
 use crate::inject::{self, TransportSender};
+use crate::lockdown;
 use crate::reassembly::TcpStream;
 use crate::probe;
 use crate::redirect;
@@ -26,6 +27,12 @@ const ESCALATE_THRESHOLD: u32 = 3;
 const ESCALATE_WINDOW: Duration = Duration::from_secs(60);
 const ESCALATION_TTL: Duration = Duration::from_secs(3600); // auto-escalated blocks expire
 const ESCALATED_IP_FILE: &str = "config/escalated_ip.yml"; // ip -> expiry, merged into blocked_ip on startup
+
+// --lockdown: any IP/SNI/JA3/signature match locks that source IP down at
+// the pf level immediately (not after N offenses, unlike escalation) - a
+// deterministic kernel drop, not a raced RST. Also TTL-bounded + persisted.
+const LOCKDOWN_TTL: Duration = Duration::from_secs(3600);
+const LOCKDOWN_FILE: &str = "config/lockdown.yml";
 
 /// Crude but sufficient check for "this looks like the start of an HTTP request".
 fn looks_like_http_request(payload: &[u8]) -> bool {
@@ -107,12 +114,15 @@ pub struct Engine {
     probe_targets: Vec<String>, // allow-list for active probing, see probe.rs
     cannon: CannonConfig, // response-injection allow-list + payload, see cannon.rs
     cannon_enabled: bool,
+    lockdown_ips: Vec<(String, Instant)>, // deterministic pf-level blocks, see lockdown.rs
+    lockdown_enabled: bool,
     trace: bool, // print every raw packet, not just classification/block events
     block_stats: BlockStats,
     escalation: HashMap<IpAddr, (u32, Instant)>, // offense count + window start, per source IP
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         inject_enabled: bool,
         inject_on_detect: bool,
@@ -125,6 +135,8 @@ impl Engine {
         probe_targets: Vec<String>,
         cannon: CannonConfig,
         cannon_enabled: bool,
+        lockdown_ips: Vec<(String, Duration)>, // (ip, remaining TTL)
+        lockdown_enabled: bool,
         trace: bool,
         block_stats: BlockStats,
     ) -> std::io::Result<Self> {
@@ -179,8 +191,12 @@ impl Engine {
         if cannon_enabled {
             println!("[cannon] hosts={:?} marker={:?} redirect={:?}", cannon.hosts, cannon.marker, cannon.redirect);
         }
+        for (ip, d) in &lockdown_ips {
+            println!("[lockdown] {ip} (expires in {}s)", d.as_secs());
+        }
         let now = Instant::now();
         let blocked_ip = blocked_ip.into_iter().map(|(ip, ttl)| (ip, ttl.map(|d| now + d))).collect();
+        let lockdown_ips = lockdown_ips.into_iter().map(|(ip, d)| (ip, now + d)).collect();
         Ok(Self {
             streams: HashMap::new(),
             udp_timing: HashMap::new(),
@@ -195,6 +211,8 @@ impl Engine {
             probe_targets,
             cannon,
             cannon_enabled,
+            lockdown_ips,
+            lockdown_enabled,
             trace,
             block_stats,
             escalation: HashMap::new(),
@@ -246,8 +264,26 @@ impl Engine {
         self.blocked_ip = kept;
     }
 
+    /// Drop expired lockdown entries and, unlike prune_expired_ips, actually
+    /// re-push the reduced set to pf - a stale rule left in the anchor keeps
+    /// blocking traffic at the kernel level regardless of what dpi-lab's own
+    /// in-memory state thinks.
+    fn prune_expired_lockdowns(&mut self) {
+        let now = Instant::now();
+        let before = self.lockdown_ips.len();
+        self.lockdown_ips.retain(|(_, exp)| now < *exp);
+        if self.lockdown_ips.len() != before {
+            let ips: Vec<String> = self.lockdown_ips.iter().map(|(ip, _)| ip.clone()).collect();
+            if let Err(e) = lockdown::apply_all(&ips) {
+                eprintln!("[lockdown] failed to update firewall rules after expiry: {e}");
+            }
+            println!("  [lockdown] expired entries removed, firewall rules updated");
+        }
+    }
+
     fn handle_tcp(&mut self, src: IpAddr, dst: IpAddr, tcp: &TcpPacket) {
         self.prune_expired_ips(); // must run before `state` borrow below
+        self.prune_expired_lockdowns();
         let (sport, dport) = (tcp.get_source(), tcp.get_destination());
         let key = (src, sport, dst, dport);
         let syn = tcp.get_flags() & TcpFlags::SYN != 0;
@@ -311,6 +347,9 @@ impl Engine {
             if self.blocked_ip.iter().any(|(rule, _)| ip_rule_matches(rule, &src) || ip_rule_matches(rule, &dst)) {
                 println!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport}");
                 block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ip", "");
+                if self.lockdown_enabled {
+                    lockdown_on_match(&mut self.lockdown_ips, src, "ip");
+                }
             }
         }
 
@@ -321,6 +360,9 @@ impl Engine {
         for hit in self.sigs.matches(scan_buf) {
             println!("  [signature] {hit} in {src}:{sport} -> {dst}:{dport}");
             block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "signature", hit);
+            if self.lockdown_enabled {
+                lockdown_on_match(&mut self.lockdown_ips, src, "signature");
+            }
         }
         state.sig_scanned_len = state.stream.delivered.len();
 
@@ -338,12 +380,18 @@ impl Engine {
                     }
                     if self.blocked_ja3.iter().any(|h| h == &hash) {
                         block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja3", &hash);
+                        if self.lockdown_enabled {
+                            lockdown_on_match(&mut self.lockdown_ips, src, "ja3");
+                        }
                     }
                 }
                 if let Some(name) = ch.sni {
                     println!("  [sni] {src}:{sport} -> {dst}:{dport}  server_name={name}");
                     if self.blocked_sni.iter().any(|s| s == &name) {
                         block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "sni", &name);
+                        if self.lockdown_enabled {
+                            lockdown_on_match(&mut self.lockdown_ips, src, "sni");
+                        }
                     }
                     state.sni = Some(name);
                 }
@@ -368,6 +416,9 @@ impl Engine {
                     };
                     if self.inject_on_detect && confirmed {
                         block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "detect", label);
+                        if self.lockdown_enabled {
+                            lockdown_on_match(&mut self.lockdown_ips, src, "detect");
+                        }
                     }
                 }
                 state.checked_entropy = true;
@@ -502,6 +553,27 @@ fn block(
     }
 }
 
+/// --lockdown: any match (IP/SNI/JA3/signature/detect) locks the source IP
+/// down at the pf level immediately, independent of whether the RST race
+/// above fired or even ran (lockdown doesn't need --inject's raw socket at
+/// all) - a deterministic kernel drop rather than a raced packet.
+fn lockdown_on_match(lockdown_ips: &mut Vec<(String, Instant)>, src: IpAddr, kind: &str) {
+    let src_s = src.to_string();
+    if lockdown_ips.iter().any(|(ip, _)| ip == &src_s) {
+        return; // already locked down
+    }
+    lockdown_ips.push((src_s.clone(), Instant::now() + LOCKDOWN_TTL));
+    let ips: Vec<String> = lockdown_ips.iter().map(|(ip, _)| ip.clone()).collect();
+    if let Err(e) = lockdown::apply_all(&ips) {
+        eprintln!("  [lockdown] failed to apply firewall rule for {src_s}: {e}");
+        lockdown_ips.pop(); // roll back - firewall state and our list must agree
+        return;
+    }
+    let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + LOCKDOWN_TTL.as_secs();
+    crate::config::set_expiry_entry(std::path::Path::new(LOCKDOWN_FILE), &src_s, epoch);
+    println!("  [lockdown] {src_s} blocked at firewall level ({kind} match, expires in {LOCKDOWN_TTL:?})");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,7 +585,7 @@ mod tests {
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
-        ], vec![], vec![], vec![], CannonConfig::default(), false, false, Arc::new(Mutex::new(HashMap::new())))
+        ], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
         .unwrap();
         std::thread::sleep(Duration::from_millis(5)); // let the zero-TTL entry actually pass
         engine.prune_expired_ips();

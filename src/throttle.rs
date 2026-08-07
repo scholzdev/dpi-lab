@@ -13,27 +13,31 @@ use std::process::Command;
 const ANCHOR: &str = "dpi-lab-throttle";
 const PIPE_BASE: u16 = 100; // arbitrary base unlikely to collide with other dummynet users
 
-/// Rate-limit all traffic to/from `ip` to `kbit_s` kilobits/sec. Requires root
-/// (same as everything else here needing raw sockets/system config) and
-/// modifies real system pf state.
-pub fn throttle_ip(ip: &str, kbit_s: u32, pipe_num: u16) -> std::io::Result<()> {
+/// Configure one dnctl pipe for `ip` at `kbit_s` kilobits/sec. Requires root
+/// (same as everything else here needing raw sockets/system config).
+fn configure_pipe(ip: &str, kbit_s: u32, pipe_num: u16) -> std::io::Result<()> {
     run(&["dnctl", "pipe", &pipe_num.to_string(), "config", "bw", &format!("{kbit_s}Kbit/s")])?;
-
-    let rule = format!(
-        "dummynet quick from {ip} to any pipe {pipe_num}\ndummynet quick from any to {ip} pipe {pipe_num}\n"
-    );
-    load_anchor_rule(&rule)?;
     println!("[throttle] {ip} limited to {kbit_s}Kbit/s (pipe {pipe_num})");
     Ok(())
 }
 
 /// Apply every "ip: kbit_s" entry from config/throttle.yml, one pipe per entry.
-/// Errors on any one entry are reported but don't stop the others from applying.
+/// `pfctl -f` replaces an anchor's rules wholesale, so all entries' dummynet
+/// rules must be loaded together in one pass - loading them one anchor-write
+/// per entry would silently drop every entry but the last.
 pub fn apply_all(entries: &[(String, u32)]) {
+    let mut rule = String::new();
     for (i, (ip, kbit_s)) in entries.iter().enumerate() {
         let pipe_num = PIPE_BASE + i as u16;
-        if let Err(e) = throttle_ip(ip, *kbit_s, pipe_num) {
-            eprintln!("[throttle] failed to throttle {ip}: {e}");
+        if let Err(e) = configure_pipe(ip, *kbit_s, pipe_num) {
+            eprintln!("[throttle] failed to configure pipe for {ip}: {e}");
+            continue;
+        }
+        rule.push_str(&format!("dummynet quick from {ip} to any pipe {pipe_num}\ndummynet quick from any to {ip} pipe {pipe_num}\n"));
+    }
+    if !rule.is_empty() {
+        if let Err(e) = load_anchor_rule(&rule) {
+            eprintln!("[throttle] failed to load anchor rules: {e}");
         }
     }
 }

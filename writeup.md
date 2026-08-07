@@ -340,6 +340,40 @@ lab Pi already has a reverse proxy (Traefik) holding port 80 for real
 services, so testing used port 81 instead rather than disrupting that
 routing to free the real port.
 
+### 3.10 Deterministic lockdown (inline, not off-path)
+
+Every mechanism above §3.7 is off-path: it forges an *extra* packet that
+races the real traffic and can lose (§1). `--lockdown` is the second
+genuinely inline mechanism (alongside throttling): instead of racing a
+spoofed RST, an IP/SNI/JA3/signature/detect match adds that source IP to a
+dedicated pf anchor (`block drop quick from/to <ip>`) - the kernel itself
+then drops every subsequent packet for that IP, deterministically, no race
+to lose. It's the actual "lockdown" primitive a real firewall or GFW-style
+border device would use; RST injection only approximates that behavior from
+off-path, and only ever probabilistically.
+
+Unlike escalation (which re-checks an in-memory list against every packet),
+lockdown fires immediately on the *first* match rather than after N
+offenses, and its effect lives in the kernel's own firewall table rather
+than dpi-lab's process memory - so it keeps blocking even if dpi-lab itself
+is killed mid-session, until `clear_all()` runs on a clean exit or someone
+manually clears the anchor. TTL-bounded and persisted the same way as
+escalated IPs (`config/lockdown.yml`, ip -> unix-epoch expiry), except
+expiry here has to actively re-push the reduced rule set to pf, not just
+update in-memory state - a stale kernel rule doesn't expire on its own just
+because dpi-lab's own bookkeeping says it should.
+
+**A real bug found and fixed while building this**: `pfctl -a <anchor> -f -`
+replaces an anchor's entire rule set on every call, not append to it.
+`throttle.rs`'s original `apply_all` (written earlier in this project) called
+its per-IP helper once per config entry, each call individually reloading
+the anchor - meaning only the *last* entry in `config/throttle.yml` would
+ever actually be enforced, with every earlier entry silently overwritten.
+Building lockdown's `apply_all` correctly (accumulate the full rule set,
+write it once) surfaced the same latent bug in the mechanism it was modeled
+after; fixed there too. Neither had been caught before because testing so
+far only ever exercised a single throttle entry at a time.
+
 ## 4. Evaluation
 
 ### 4.1 A real false-positive, found and fixed during testing
@@ -452,6 +486,14 @@ All of the following were run live, not simulated:
   concurrency-safe reputation store.
 - **Response injection is IPv4-only**, same reason as RST injection (needs a
   separate raw IPv6 socket + pseudo-header checksum, not built).
+- **Lockdown** has been verified live in the lab (pf actually drops matched
+  traffic, `clear_all()` restores it on exit) in addition to
+  `lockdown::tests`' ruleset-construction checks. IPv4-only in practice
+  (blocked_ip/`ip_rule_matches` are IPv4-focused for CIDR; exact-IPv6 matches
+  would work but haven't been exercised here). Kernel-level, not per-flow:
+  locking an IP down blocks *all* its traffic, not just the
+  matched flow - a broader blast radius than RST injection's per-connection
+  reset, intentional for what "lockdown" means but worth stating precisely.
 
 ## 5. Related work
 
