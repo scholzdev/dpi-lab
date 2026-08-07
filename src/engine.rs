@@ -1,7 +1,7 @@
 // Per-packet pipeline: decode -> reassemble -> classify -> (optionally) inject/redirect.
 // Owns all mutable state so main.rs stays just capture loop + CLI.
 use crate::cannon;
-use crate::classify::{ja3, parse_dns_query_full, parse_client_hello, Signatures};
+use crate::classify::{self, ja3, parse_dns_query_full, parse_client_hello, Signatures};
 use crate::config::CannonConfig;
 use crate::detect::{classify_first_segment, TLS_LIKE_PORTS};
 use crate::inject::{self, TransportSender};
@@ -104,6 +104,7 @@ pub struct Engine {
     streams: HashMap<FlowKey, FlowState>,
     udp_timing: HashMap<FlowKey, TimingStats>,
     sigs: Signatures,
+    handshake_rules: Vec<classify::HandshakeRule>, // known protocol handshake signatures, see config/handshakes.yml
     injector: Option<TransportSender>,
     inject_on_detect: bool, // separate opt-in: entropy detect is a heuristic, not a deterministic match
     dns_redirect: Option<(HashMap<String, Ipv4Addr>, TransportSender)>,
@@ -131,6 +132,7 @@ impl Engine {
         blocked_ja3: Vec<String>,
         blocked_ip: Vec<(String, Option<Duration>)>, // (ip, remaining TTL); None = permanent
         signatures: Vec<String>,
+        handshake_rules: Vec<classify::HandshakeRule>,
         redirect_map: Vec<(String, String)>,
         probe_targets: Vec<String>,
         cannon: CannonConfig,
@@ -188,6 +190,9 @@ impl Engine {
         for s in &signatures {
             println!("[block-sig] {s}");
         }
+        for r in &handshake_rules {
+            println!("[handshake] {} (length={:?}, {} anchors)", r.name, r.length, r.anchors.len());
+        }
         if cannon_enabled {
             println!("[cannon] hosts={:?} marker={:?} redirect={:?}", cannon.hosts, cannon.marker, cannon.redirect);
         }
@@ -201,6 +206,7 @@ impl Engine {
             streams: HashMap::new(),
             udp_timing: HashMap::new(),
             sigs: Signatures::new(&signatures),
+            handshake_rules,
             injector,
             inject_on_detect,
             dns_redirect,
@@ -476,6 +482,20 @@ impl Engine {
             if let Some(name) = parse_dns_query_full(payload).map(|q| q.name) {
                 println!("  [dns] {src}:{sport} -> {dst}:{dport}  query={name}");
             }
+        } else if let Some(rule) = self.handshake_rules.iter().find(|r| classify::matches_handshake(payload, r)) {
+            // Structural recognition (byte anchors + exact length from
+            // config/handshakes.yml), not a keyword search - fires on any
+            // connection attempting that handshake regardless of destination
+            // IP/port, not just one already on a blocklist. This only ever
+            // catches the handshake message itself, not an already-established
+            // session (those look like opaque encrypted data, same blind spot
+            // as obfs4 - see detect.rs). UDP has no RST equivalent, so
+            // --inject doesn't apply here; --lockdown (IP-level,
+            // protocol-agnostic) does.
+            println!("  [detect] {} on {src}:{sport} -> {dst}:{dport}", rule.name);
+            if self.lockdown_enabled {
+                lockdown_on_match(&mut self.lockdown_ips, src, &rule.name);
+            }
         }
         if self.trace {
             println!("UDP  {src}:{sport} -> {dst}:{dport}  len={len}", len = payload.len());
@@ -585,7 +605,7 @@ mod tests {
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
-        ], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
+        ], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
         .unwrap();
         std::thread::sleep(Duration::from_millis(5)); // let the zero-TTL entry actually pass
         engine.prune_expired_ips();

@@ -16,7 +16,10 @@
 // config/cannon.yml's allow-list - own lab hosts only. --lockdown makes any
 // IP/SNI/JA3/signature match a hard, TTL-bounded macOS pfctl block (kernel
 // drops every subsequent packet, not just a raced RST) - persists to
-// config/lockdown.yml the same way escalated_ip.yml does.
+// config/lockdown.yml the same way escalated_ip.yml does. Known protocol
+// handshakes (structural signatures, not keyword matches) load from
+// config/handshakes.yml and feed the same [detect]/lockdown pipeline as
+// everything else - UDP only for now, no RST equivalent for that transport.
 // (no arg = list interfaces)
 mod cannon;
 mod classify;
@@ -116,6 +119,9 @@ fn main() {
     block_ip.extend(flag_values(&args, "--block-ip").into_iter().map(|ip| (ip, None)));
     let mut signatures = config::load_list(&config_dir.join("signatures.yml"));
     signatures.extend(flag_values(&args, "--block-sig"));
+    // Known protocol handshake signatures (byte anchors + exact length) -
+    // structural recognition, not a keyword search. See classify::HandshakeRule.
+    let handshake_rules = config::load_handshake_rules(&config_dir.join("handshakes.yml"));
     let redirect_map = config::load_map(&config_dir.join("redirect.yml"));
     // Active-probing allow-list: only these hosts (your own lab boxes) ever
     // get an outbound probe connection on a [detect] hit. Empty by default.
@@ -153,6 +159,7 @@ fn main() {
         block_ja3,
         block_ip,
         signatures,
+        handshake_rules,
         redirect_map,
         probe_targets,
         cannon,

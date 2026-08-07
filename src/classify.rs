@@ -189,6 +189,35 @@ pub fn parse_dns_query_full(data: &[u8]) -> Option<DnsQuery> {
     Some(DnsQuery { id, name: labels.join("."), question_raw })
 }
 
+/// One known protocol handshake signature: an optional exact total length,
+/// plus a set of (offset, expected bytes) anchors that must all match. Fixed
+/// wire-format handshakes (WireGuard, OpenVPN, ...) are recognized this way -
+/// structure/shape, not a keyword search - so a rule fires on any connection
+/// attempting that handshake regardless of destination IP/port, not just one
+/// already on a blocklist. Loaded from config/handshakes.yml, see config.rs.
+#[derive(serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct HandshakeRule {
+    pub name: String,
+    pub length: Option<usize>,
+    #[serde(rename = "match", default)]
+    pub anchors: Vec<HandshakeAnchor>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct HandshakeAnchor {
+    pub offset: usize,
+    pub bytes: Vec<u8>,
+}
+
+/// True if `payload` matches every anchor (and the exact length, if set) in `rule`.
+pub fn matches_handshake(payload: &[u8], rule: &HandshakeRule) -> bool {
+    if let Some(len) = rule.length {
+        if payload.len() != len {
+            return false;
+        }
+    }
+    rule.anchors.iter().all(|a| payload.get(a.offset..a.offset + a.bytes.len()) == Some(a.bytes.as_slice()))
+}
 
 #[cfg(test)]
 mod tests {
@@ -205,6 +234,49 @@ mod tests {
     fn signature_no_match() {
         let sigs = Signatures::new(&["evil.com"]);
         assert!(sigs.matches(b"GET / HTTP/1.1\r\nHost: fine.com\r\n").is_empty());
+    }
+
+    fn wireguard_rule() -> HandshakeRule {
+        HandshakeRule {
+            name: "wireguard-handshake-init".to_string(),
+            length: Some(148),
+            anchors: vec![HandshakeAnchor { offset: 0, bytes: vec![1, 0, 0, 0] }],
+        }
+    }
+
+    #[test]
+    fn handshake_recognized_by_structure() {
+        let mut pkt = vec![0u8; 148];
+        pkt[0] = 1; // handshake-initiation type; reserved [1..4] already zero
+        assert!(matches_handshake(&pkt, &wireguard_rule()));
+    }
+
+    #[test]
+    fn wrong_length_not_recognized() {
+        let mut pkt = vec![0u8; 100]; // right type, wrong length
+        pkt[0] = 1;
+        assert!(!matches_handshake(&pkt, &wireguard_rule()));
+    }
+
+    #[test]
+    fn wrong_type_not_recognized() {
+        let pkt = vec![0u8; 148]; // right length, type byte is 0 not 1
+        assert!(!matches_handshake(&pkt, &wireguard_rule()));
+    }
+
+    #[test]
+    fn nonzero_reserved_not_recognized() {
+        let mut pkt = vec![0u8; 148];
+        pkt[0] = 1;
+        pkt[2] = 5; // reserved bytes must be zero
+        assert!(!matches_handshake(&pkt, &wireguard_rule()));
+    }
+
+    #[test]
+    fn rule_with_no_anchors_matches_on_length_alone() {
+        let rule = HandshakeRule { name: "any-148-byte-udp".to_string(), length: Some(148), anchors: vec![] };
+        assert!(matches_handshake(&[0u8; 148], &rule));
+        assert!(!matches_handshake(&[0u8; 100], &rule));
     }
 
     #[test]

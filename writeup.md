@@ -374,6 +374,63 @@ write it once) surfaced the same latent bug in the mechanism it was modeled
 after; fixed there too. Neither had been caught before because testing so
 far only ever exercised a single throttle entry at a time.
 
+### 3.11 Structural protocol handshake recognition (not keyword matching)
+
+Keyword signatures (§3.1) search for a literal string anywhere in a payload -
+crude, and evadable by anything that doesn't send that exact string
+unmodified. Real protocols with fixed, documented wire formats can instead be
+recognized *structurally*: specific bytes at specific offsets, often with an
+exact total message length, independent of any string content. WireGuard's
+handshake-initiation message is a clean example - message type `1`, 3
+reserved zero bytes, then a fixed 148-byte total length (sender index +
+ephemeral key + encrypted static key + encrypted timestamp + two MACs, all
+fixed-size fields). `classify::matches_handshake` checks a `HandshakeRule`
+(an optional exact length plus a list of offset -> expected-bytes anchors)
+against a payload; `config/handshakes.yml` holds the actual rule database -
+config-driven like every other block list here, not hardcoded, so adding a
+second protocol (OpenVPN's opcode byte, say) is a YAML edit, not a rebuild.
+
+**What this precisely does and doesn't catch.** It's more accurate to call
+this a *handshake* blocker than a *protocol* blocker: it only recognizes the
+handshake-initiation message itself, not an already-established session's
+data traffic, which is opaque encrypted bytes with no fixed structure -
+exactly the same blind spot entropy detection (§3.5) exists to (imperfectly)
+address. The reason this still amounts to blocking the VPN in practice:
+WireGuard has no fallback if its handshake-initiation never gets a response -
+killing that one message is sufficient to prevent the tunnel from ever
+forming, even though the *mechanism* only ever acts on one specific message
+type, not "WireGuard traffic" as a general category. Because recognition is
+structural rather than IP-based, it also fires on *any* WireGuard handshake
+attempt regardless of which server it's aimed at - unlike `config/ip.yml`,
+which requires already knowing the target IP in advance.
+
+Wired into the same pipeline as everything else: a match prints `[detect]
+<rule-name> on ...` and, with `--lockdown`, pf-blocks the source IP. UDP has
+no TCP-RST equivalent, so `--inject` doesn't apply to handshake matches;
+`--lockdown`'s IP-level block is protocol-agnostic and works regardless.
+
+**Rule database, and an explicit confidence tier per entry.** No public
+"database" of these signatures in this project's rule format exists (nDPI and
+Wireshark's dissectors are the closest real references, but neither is a
+drop-in - both encode detection as code, sometimes stateful, not a flat
+offset+bytes list); `config/handshakes.yml`'s three seeded rules were each
+hand-derived from a primary source, and are labeled with different confidence
+levels rather than presented uniformly:
+
+- `wireguard-handshake-init` - **live-verified** against a real `wg-easy`
+  tunnel (§4.2).
+- `ikev2-sa-init` - derived from RFC 7296 §3.1's fixed 28-byte IKE header
+  (Responder SPI, Version, Exchange Type, Flags, Message ID all zero/fixed on
+  the first packet of an exchange); not live-verified against real IKEv2
+  traffic. Non-NAT-T only.
+- `openvpn-hard-reset-client-v2` - **lowest confidence of the three**: a
+  single-byte anchor (`0x38`, from OpenVPN's documented `opcode<<3 | key_id`
+  scheme for `P_CONTROL_HARD_RESET_CLIENT_V2`) recalled from general protocol
+  knowledge, not checked against a packet capture or the OpenVPN source
+  directly. Flagged in the YAML file itself as a starting point to verify,
+  not a trusted signature - a single-byte anchor is also inherently more
+  false-positive-prone than WireGuard's byte-anchors-plus-exact-length.
+
 ## 4. Evaluation
 
 ### 4.1 A real false-positive, found and fixed during testing
@@ -494,6 +551,14 @@ All of the following were run live, not simulated:
   locking an IP down blocks *all* its traffic, not just the
   matched flow - a broader blast radius than RST injection's per-connection
   reset, intentional for what "lockdown" means but worth stating precisely.
+- **Handshake rule database has three entries at three different confidence
+  levels**, not three equally-trustworthy signatures - see §3.11's per-rule
+  breakdown. The database mechanism generalizes cleanly (a YAML edit adds a
+  protocol); what doesn't generalize is verification - each new rule still
+  needs someone to confirm it against a real packet capture or the actual
+  protocol source, and only WireGuard's has been. IKEv2 and OpenVPN's rules
+  are unverified and should be treated as drafts, not trusted signatures,
+  until checked against real traffic.
 
 ## 5. Related work
 

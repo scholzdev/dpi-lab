@@ -93,6 +93,20 @@ pub fn load_cannon_config(path: &Path) -> CannonConfig {
     }
 }
 
+/// Load config/handshakes.yml - a list of known protocol handshake
+/// signatures (see classify::HandshakeRule). Same missing/malformed handling
+/// as everything else here: empty list, not a crash.
+pub fn load_handshake_rules(path: &Path) -> Vec<crate::classify::HandshakeRule> {
+    let Ok(contents) = std::fs::read_to_string(path) else { return Vec::new() };
+    match serde_yaml::from_str(&contents) {
+        Ok(rules) => rules,
+        Err(e) => {
+            eprintln!("[config] failed to parse {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +182,37 @@ mod tests {
     fn missing_cannon_config_is_default() {
         let cfg = load_cannon_config(Path::new("/nonexistent/cannon.yml"));
         assert_eq!(cfg, CannonConfig::default());
+    }
+
+    #[test]
+    fn loads_handshake_rules() {
+        let path = tempfile("loads_handshake_rules");
+        std::fs::write(
+            &path,
+            "- name: wireguard-handshake-init\n  length: 148\n  match:\n    - offset: 0\n      bytes: [1, 0, 0, 0]\n",
+        )
+        .unwrap();
+        let rules = load_handshake_rules(&path);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "wireguard-handshake-init");
+        assert_eq!(rules[0].length, Some(148));
+        assert_eq!(rules[0].anchors[0].bytes, vec![1, 0, 0, 0]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_handshake_rules_is_empty_list() {
+        assert!(load_handshake_rules(Path::new("/nonexistent/handshakes.yml")).is_empty());
+    }
+
+    /// Regression guard on the actual shipped file, not a synthetic fixture -
+    /// catches a broken config/handshakes.yml (bad YAML, wrong rule count)
+    /// before it ships silently as "zero rules loaded, no error printed."
+    #[test]
+    fn real_handshakes_yml_parses_with_expected_rules() {
+        let rules = load_handshake_rules(Path::new("config/handshakes.yml"));
+        let names: Vec<&str> = rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["wireguard-handshake-init", "ikev2-sa-init", "openvpn-hard-reset-client-v2"]);
     }
 
     // unique-per-test filename in the OS temp dir - tests run in parallel

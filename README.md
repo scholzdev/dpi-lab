@@ -3,11 +3,12 @@
 A DPI pipeline - capture → reassemble → classify → active interference - built
 to study and replicate mechanisms documented in Great Firewall research:
 keyword/SNI/JA3 filtering, TCP RST injection, DNS response spoofing,
-entropy-based detection of obfuscated proxy protocols, allow-list-scoped
-active probing, Great-Cannon-style HTTP response injection, adaptive
-TTL-bounded IP escalation, local bandwidth throttling, and deterministic
-pf-level lockdown. Built as a portfolio piece for network
-security/penetration testing applications.
+entropy-based detection of obfuscated proxy protocols, structural protocol
+handshake recognition (e.g. WireGuard), allow-list-scoped active probing,
+Great-Cannon-style HTTP response injection, adaptive TTL-bounded IP
+escalation, local bandwidth throttling, and deterministic pf-level lockdown.
+Built as a portfolio piece for network security/penetration testing
+applications.
 
 ## Ethics / scope
 
@@ -37,7 +38,7 @@ at infrastructure you own or are explicitly authorized to test.
 
 ```bash
 cargo build
-cargo test                              # 47 unit tests, no network/root needed
+cargo test                              # 55 unit tests, no network/root needed
 sudo ./target/debug/dpi-lab <interface> [flags]
 ```
 
@@ -54,11 +55,13 @@ to actually capture). Key flags:
 | `--trace` | print every raw TCP/UDP packet (flood); off by default, only classification/block events print |
 | `--block-sni/-ja3/-ip/-sig <value>` | repeatable, adds one rule on top of the matching `config/*.yml` |
 
-Block lists (`config/{sni,ja3,ip,signatures}.yml`), the DNS redirect map
-(`config/redirect.yml`), throttle rates (`config/throttle.yml`), the
-active-probing allow-list (`config/probe_targets.yml`), and the response-
-injection allow-list + payload (`config/cannon.yml`) are all plain YAML - own
-lab hosts only, edit the file, no rebuild needed. Auto-escalated IPs
+Block lists (`config/{sni,ja3,ip,signatures}.yml`), known protocol handshake
+signatures (`config/handshakes.yml` - byte anchors + length, not keywords),
+the DNS redirect map (`config/redirect.yml`), throttle rates
+(`config/throttle.yml`), the active-probing allow-list
+(`config/probe_targets.yml`), and the response-injection allow-list + payload
+(`config/cannon.yml`) are all plain YAML - own lab hosts only, edit the file,
+no rebuild needed. Auto-escalated IPs
 (`config/escalated_ip.yml`) and lockdown IPs (`config/lockdown.yml`, written
 by dpi-lab itself, not hand-edited) both persist with a TTL and survive
 restarts; already-expired entries are dropped automatically. Ctrl-C prints a
@@ -81,6 +84,7 @@ sudo ./scripts/repro_sig_block.sh     # live signature-match -> RST block, needs
 | `src/reassembly.rs` | TCP stream reassembly, anchored on the SYN's ISN |
 | `src/classify.rs` | keyword signatures (Aho-Corasick), TLS SNI + JA3 fingerprint, DNS query parsing |
 | `src/detect.rs` | Shannon-entropy check for obfuscated/proxy traffic |
+| `src/classify.rs`'s `HandshakeRule`/`matches_handshake` | structural protocol handshake recognition (byte anchors + length), config-driven via `config/handshakes.yml` |
 | `src/inject.rs` | forged TCP RST construction + raw-socket send |
 | `src/redirect.rs` | forged DNS A/AAAA response construction + send (IPv4 + IPv6) |
 | `src/throttle.rs` | macOS `pfctl`/`dnctl` bandwidth throttling - the one inline (non-spoofing) mechanism |

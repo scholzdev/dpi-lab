@@ -1,0 +1,44 @@
+# Known protocol handshake signatures - structural recognition (byte anchors
+# + exact length), not a keyword search. Fires on any connection attempting
+# that handshake regardless of destination IP/port, not just one already on
+# a blocklist. Only catches the handshake message itself; an already-
+# established session (opaque encrypted data) is invisible to this, same
+# blind spot as obfs4 - see detect.rs's entropy check for that case instead.
+#
+# `length` (optional): exact total payload length required.
+# `match`: list of byte anchors, each an offset + the exact bytes expected there.
+- name: wireguard-handshake-init
+  # Verified live against a real wg-easy tunnel (see writeup.md §4.2).
+  length: 148 # type(1) + reserved(3) + sender_index(4) + ephemeral(32) + encrypted_static(48) + encrypted_timestamp(28) + mac1(16) + mac2(16)
+  match:
+    - offset: 0
+      bytes: [1, 0, 0, 0] # message type 1 (handshake initiation) + 3 zero reserved bytes
+
+- name: ikev2-sa-init
+  # Derived from RFC 7296 §3.1's fixed 28-byte IKE header, not yet
+  # live-verified against real traffic. No exact `length` here - unlike
+  # WireGuard, the SA proposal payloads that follow the header vary in size,
+  # so only the fixed header fields are anchored. Non-NAT-T only (NAT-T on
+  # UDP/4500 prepends 4 zero bytes before this header, not accounted for).
+  match:
+    - offset: 8
+      bytes: [0, 0, 0, 0, 0, 0, 0, 0] # Responder SPI: zero until the responder replies
+    - offset: 17
+      bytes: [0x20] # Version: major=2, minor=0 (IKEv2)
+    - offset: 18
+      bytes: [0x22] # Exchange Type: IKE_SA_INIT (34)
+    - offset: 19
+      bytes: [0x08] # Flags: Initiator bit set, Response/Version bits clear
+    - offset: 20
+      bytes: [0, 0, 0, 0] # Message ID: 0 for the first exchange
+
+- name: openvpn-hard-reset-client-v2
+  # Best-effort from OpenVPN's documented opcode scheme (opcode<<3 | key_id);
+  # P_CONTROL_HARD_RESET_CLIENT_V2 = 7, key_id = 0 on a fresh session ->
+  # 0x38. NOT packet-captured or otherwise confirmed - treat as a starting
+  # point to verify against real OpenVPN traffic, not a trusted signature yet.
+  # No `length`: control-channel packet size varies with tls-auth/tls-crypt
+  # and ack-array contents.
+  match:
+    - offset: 0
+      bytes: [0x38]
