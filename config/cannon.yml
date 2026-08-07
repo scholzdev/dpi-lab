@@ -1,0 +1,9 @@
+# Great-Cannon-style HTTP response injection (--cannon). ONLY fires when BOTH
+# the requester and the server are in `hosts` - own lab boxes only, e.g. your
+# laptop and your Raspberry Pi. The injected body is always inert: a visible
+# marker string, plus an optional redirect. Never a real payload, and never
+# fires against a host not listed here.
+hosts: []
+marker: "[DDoS payload would go here - dpi-lab demo, nothing executed]"
+redirect: null
+port: 80 # plaintext HTTP port to watch; change if 80 is taken by something real (e.g. a reverse proxy)

@@ -1,0 +1,3 @@
+# TLS SNI hostnames to reset on sight. Matches the exact hostname sent in the
+# ClientHello's server_name extension - own lab/domains only, see README.
+- florianscholz.dev

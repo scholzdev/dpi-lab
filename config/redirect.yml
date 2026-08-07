@@ -1,0 +1,4 @@
+# orig domain -> redirect target hostname, for --redirect-dns. Target is
+# resolved to an IP (A and/or AAAA) once at startup, not hardcoded here,
+# since real IPs change.
+florianscholz.dev: example.com

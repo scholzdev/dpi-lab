@@ -1,0 +1,5 @@
+# JA3 hashes to reset on sight, regardless of destination - blocks by TLS client
+# fingerprint instead of by domain. Capture your own hashes (see README) rather
+# than trusting a third-party list; label the client in a comment for your own
+# reference, e.g.:
+- 375c6162a492dfbf2795909110ce8424  # curl/8.7.1 (macOS/LibreSSL)

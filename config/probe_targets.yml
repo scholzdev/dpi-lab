@@ -1,0 +1,6 @@
+# Hosts eligible for active probing on a [detect] (suspected-obfuscated-protocol)
+# hit - dpi-lab will connect OUT to any host here and try known proxy-protocol
+# handshakes to confirm before trusting the entropy heuristic alone. Keep this
+# to your own lab boxes only (e.g. your Raspberry Pi) - never a third-party
+# host, probing anything you don't own/control is out of scope for this tool.
+[]

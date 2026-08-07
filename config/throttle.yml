@@ -1,0 +1,4 @@
+# ip -> kbit/s. Rate-limits that IP's traffic via macOS pfctl/dnctl (dummynet) -
+# real system firewall state, cleared automatically on exit (Ctrl-C). Empty by
+# default; requires root, same as --inject/--redirect-dns.
+{}

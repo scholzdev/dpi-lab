@@ -1,0 +1,5 @@
+# Keyword/substring signatures to reset on sight, scanned against the
+# reassembled TCP payload (works on plaintext HTTP, not TLS - see the write-up
+# for why keyword matching doesn't apply to encrypted traffic).
+- malware
+- evil.com

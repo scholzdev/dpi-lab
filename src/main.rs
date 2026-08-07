@@ -1,0 +1,177 @@
+// Live capture -> engine pipeline (decode/reassemble/classify/inject/redirect).
+// Run: sudo ./target/debug/dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns] [--trace]
+//      [--block-sni <domain>]... [--block-ja3 <hash>]... [--block-ip <ip>]... [--block-sig <keyword>]...
+// --trace prints every raw TCP/UDP packet (flood); without it, only
+// classification/block events ([sni] [ja3] [detect] [dns] [inject] [timing] [ip]) print.
+// Block lists load from config/{sni,ja3,ip,signatures}.yml (plain YAML lists) and
+// config/redirect.yml (orig -> target mapping for --redirect-dns); CLI flags add to
+// whatever's in those files. Auto-escalated IPs persist to config/escalated_ip.yml
+// (ip -> unix-epoch expiry) and get merged back into the IP block list, with their
+// remaining TTL, on every startup - already-expired entries are dropped. Bandwidth
+// throttling (macOS pfctl/dnctl) loads from config/throttle.yml (ip -> kbit/s) and
+// applies at startup; cleared automatically on Ctrl-C. Active probing (on a
+// [detect] hit, connect out to confirm before trusting the entropy heuristic) is
+// scoped to config/probe_targets.yml - own lab hosts only. --cannon injects a
+// plaintext HTTP response (marker string and/or redirect) between two hosts on
+// config/cannon.yml's allow-list - own lab hosts only.
+// (no arg = list interfaces)
+mod cannon;
+mod classify;
+mod config;
+mod detect;
+mod engine;
+mod inject;
+mod probe;
+mod reassembly;
+mod redirect;
+mod throttle;
+mod timing;
+
+use engine::{BlockStats, Engine};
+use pnet::datalink::{self, Channel::Ethernet};
+use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ipv6::Ipv6Packet;
+use pnet::packet::Packet;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+/// Print the block-event summary and exit - called from the Ctrl-C handler.
+fn print_summary_and_exit(stats: &BlockStats) {
+    let counts = stats.lock().unwrap();
+    println!("\n--- block summary ---");
+    if counts.is_empty() {
+        println!("(no connections blocked)");
+    } else {
+        let mut kinds: Vec<_> = counts.iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(a.1)); // busiest kind first
+        let total: u32 = counts.values().sum();
+        for (kind, count) in kinds {
+            println!("  {kind:<10} {count}");
+        }
+        println!("  {:<10} {total}", "total");
+    }
+    throttle::clear_all();
+    std::process::exit(0);
+}
+
+/// Collect every value following a repeatable `--flag value` pair, e.g.
+/// `--block-sni a.com --block-sni b.com` -> `["a.com", "b.com"]`.
+fn flag_values(args: &[String], flag: &str) -> Vec<String> {
+    args.iter()
+        .zip(args.iter().skip(1))
+        .filter(|(f, _)| f.as_str() == flag)
+        .map(|(_, v)| v.clone())
+        .collect()
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let iface_name = match args.get(1) {
+        Some(n) => n.clone(),
+        None => {
+            println!("usage: dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns]\navailable interfaces:");
+            for i in datalink::interfaces() {
+                println!("  {}", i.name);
+            }
+            return;
+        }
+    };
+    // Own lab only: RST injection / DNS redirect stay off unless explicitly requested.
+    let inject_enabled = args.iter().any(|a| a == "--inject");
+    // Separate opt-in: entropy detection is a heuristic with a real false-positive
+    // rate, acting on it automatically is a stronger claim than on a signature/SNI hit.
+    let inject_on_detect = args.iter().any(|a| a == "--inject-on-detect");
+    // Redirect targets are defined in engine::REDIRECT_MAP and resolved there.
+    let redirect_enabled = args.iter().any(|a| a == "--redirect-dns");
+    // Own-lab-to-own-lab HTTP response injection (Great-Cannon-style); allow-list
+    // enforced in config/cannon.yml, this flag only turns the mechanism on at all.
+    let cannon_enabled = args.iter().any(|a| a == "--cannon");
+    let trace = args.iter().any(|a| a == "--trace");
+
+    let config_dir = Path::new("config");
+    let mut block_sni = config::load_list(&config_dir.join("sni.yml"));
+    block_sni.extend(flag_values(&args, "--block-sni"));
+    let mut block_ja3 = config::load_list(&config_dir.join("ja3.yml"));
+    block_ja3.extend(flag_values(&args, "--block-ja3"));
+    // escalated_ip.yml holds IPs auto-blocked by a previous run (ip -> unix-epoch
+    // expiry, see engine.rs's escalation logic) - merged in here so they stay
+    // blocked across restarts, with the remaining TTL carried over. Already-expired
+    // entries are dropped rather than re-added.
+    let now_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let mut block_ip: Vec<(String, Option<std::time::Duration>)> =
+        config::load_list(&config_dir.join("ip.yml")).into_iter().map(|ip| (ip, None)).collect();
+    block_ip.extend(config::load_expiry_map(&config_dir.join("escalated_ip.yml")).into_iter().filter_map(|(ip, exp)| {
+        (exp > now_epoch).then(|| (ip, Some(std::time::Duration::from_secs(exp - now_epoch))))
+    }));
+    block_ip.extend(flag_values(&args, "--block-ip").into_iter().map(|ip| (ip, None)));
+    let mut signatures = config::load_list(&config_dir.join("signatures.yml"));
+    signatures.extend(flag_values(&args, "--block-sig"));
+    let redirect_map = config::load_map(&config_dir.join("redirect.yml"));
+    // Active-probing allow-list: only these hosts (your own lab boxes) ever
+    // get an outbound probe connection on a [detect] hit. Empty by default.
+    let probe_targets = config::load_list(&config_dir.join("probe_targets.yml"));
+    let cannon = config::load_cannon_config(&config_dir.join("cannon.yml"));
+    // Same ip -> number shape as the escalated-block expiry map, just reused
+    // here for kbit/s instead of a unix timestamp.
+    let throttle_entries: Vec<(String, u32)> =
+        config::load_expiry_map(&config_dir.join("throttle.yml")).into_iter().map(|(ip, kbit)| (ip, kbit as u32)).collect();
+    throttle::apply_all(&throttle_entries);
+
+    let block_stats: BlockStats = Arc::new(Mutex::new(HashMap::new()));
+    let stats_for_handler = block_stats.clone();
+    ctrlc::set_handler(move || print_summary_and_exit(&stats_for_handler)).expect("failed to set Ctrl-C handler");
+
+    let mut engine = Engine::new(
+        inject_enabled,
+        inject_on_detect,
+        redirect_enabled,
+        block_sni,
+        block_ja3,
+        block_ip,
+        signatures,
+        redirect_map,
+        probe_targets,
+        cannon,
+        cannon_enabled,
+        trace,
+        block_stats,
+    )
+    .expect("open raw socket for --inject/--redirect-dns (need root)");
+
+    let interface = datalink::interfaces()
+        .into_iter()
+        .find(|i| i.name == iface_name)
+        .unwrap_or_else(|| panic!("no such interface: {iface_name}"));
+
+    let mut rx = match datalink::channel(&interface, Default::default()) {
+        Ok(Ethernet(_tx, rx)) => rx,
+        Ok(_) => panic!("unsupported channel type"),
+        Err(e) => panic!("failed to open {iface_name}: {e} (need root/cap_net_raw?)"),
+    };
+
+    loop {
+        let raw = match rx.next() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("capture error: {e}");
+                continue;
+            }
+        };
+        let Some(eth) = EthernetPacket::new(raw) else { continue };
+        match eth.get_ethertype() {
+            EtherTypes::Ipv4 => {
+                if let Some(ip) = Ipv4Packet::new(eth.payload()) {
+                    engine.handle_frame_v4(&ip);
+                }
+            }
+            EtherTypes::Ipv6 => {
+                if let Some(ip) = Ipv6Packet::new(eth.payload()) {
+                    engine.handle_frame_v6(&ip);
+                }
+            }
+            _ => {}
+        }
+    }
+}

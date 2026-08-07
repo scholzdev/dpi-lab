@@ -1,0 +1,4 @@
+# IP addresses to reset on sight, regardless of protocol/content - the bluntest
+# rule, blocks a flow the moment either endpoint matches, before any payload is
+# even inspected. Empty by default.
+[]
