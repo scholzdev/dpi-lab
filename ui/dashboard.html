@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dpi-lab</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 2rem; background: #111; color: #ddd; }
+  h1 { font-size: 1.2rem; }
+  h2 { font-size: 1rem; margin-top: 2rem; border-bottom: 1px solid #333; padding-bottom: .3rem; }
+  .files { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .files button { background: #222; color: #ddd; border: 1px solid #444; padding: .3rem .7rem; cursor: pointer; border-radius: 4px; }
+  .files button.active { background: #345; border-color: #56a; }
+  textarea { width: 100%; height: 16rem; background: #000; color: #9f9; font-family: monospace; font-size: .85rem; border: 1px solid #444; padding: .5rem; box-sizing: border-box; }
+  button.save { margin-top: .5rem; padding: .4rem 1rem; cursor: pointer; }
+  .status { margin-left: 1rem; font-size: .85rem; color: #9a9; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid #333; }
+  th { color: #888; }
+  .kind { color: #6cf; font-weight: bold; }
+  .empty { color: #666; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>dpi-lab</h1>
+
+<h2>Config editor</h2>
+<p style="color:#999;font-size:.85rem">Edits take effect on dpi-lab's next restart - no hot-reload. Raw JSON here maps directly to each config/*.yml file's YAML shape.</p>
+<div class="files" id="files"></div>
+<textarea id="editor" spellcheck="false"></textarea>
+<br>
+<button class="save" id="save">Save</button>
+<span class="status" id="status"></span>
+
+<h2>Live events <span style="color:#666;font-weight:normal">(polls every 2s - needs dpi-lab running with --events-log)</span></h2>
+<table id="events">
+  <thead><tr><th>time</th><th>kind</th><th>src</th><th>dst</th><th>detail</th></tr></thead>
+  <tbody id="events-body"></tbody>
+</table>
+
+<script>
+let currentFile = null;
+
+async function loadFileList() {
+  const res = await fetch('/api/config');
+  const names = await res.json();
+  const container = document.getElementById('files');
+  container.innerHTML = '';
+  names.sort().forEach(name => {
+    const btn = document.createElement('button');
+    btn.textContent = name;
+    btn.onclick = () => selectFile(name, btn);
+    container.appendChild(btn);
+  });
+  if (names.length && !currentFile) {
+    selectFile(names[0], container.firstChild);
+  }
+}
+
+async function selectFile(name, btnEl) {
+  currentFile = name;
+  document.querySelectorAll('#files button').forEach(b => b.classList.remove('active'));
+  if (btnEl) btnEl.classList.add('active');
+  const res = await fetch('/api/config/' + encodeURIComponent(name));
+  const data = await res.json();
+  document.getElementById('editor').value = JSON.stringify(data, null, 2);
+  setStatus('');
+}
+
+function setStatus(msg, isError) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.style.color = isError ? '#f77' : '#9a9';
+}
+
+document.getElementById('save').onclick = async () => {
+  if (!currentFile) return;
+  let body;
+  try {
+    body = document.getElementById('editor').value;
+    JSON.parse(body); // validate client-side before sending
+  } catch (e) {
+    setStatus('invalid JSON: ' + e.message, true);
+    return;
+  }
+  const res = await fetch('/api/config/' + encodeURIComponent(currentFile), { method: 'PUT', body });
+  if (res.ok) {
+    setStatus('saved ' + new Date().toLocaleTimeString());
+  } else {
+    const err = await res.json().catch(() => ({error: res.statusText}));
+    setStatus('save failed: ' + err.error, true);
+  }
+};
+
+async function pollEvents() {
+  try {
+    const res = await fetch('/api/events');
+    const events = await res.json();
+    const body = document.getElementById('events-body');
+    if (!events.length) {
+      body.innerHTML = '<tr><td colspan="5" class="empty">no events yet</td></tr>';
+      return;
+    }
+    body.innerHTML = events.slice().reverse().map(e => `
+      <tr>
+        <td>${e.time || ''}</td>
+        <td class="kind">${e.kind || ''}</td>
+        <td>${e.src || ''}:${e.sport || ''}</td>
+        <td>${e.dst || ''}:${e.dport || ''}</td>
+        <td>${e.detail || ''}</td>
+      </tr>`).join('');
+  } catch (e) {
+    // transient fetch failure - next poll retries, nothing to show the user for one missed tick
+  }
+}
+
+loadFileList();
+pollEvents();
+setInterval(pollEvents, 2000);
+</script>
+</body>
+</html>
