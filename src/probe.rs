@@ -67,7 +67,7 @@ fn enumerate_cidr_hosts(cidr: &str) -> Option<Vec<Ipv4Addr>> {
 /// minutes. Returns every (ip, port, protocol) hit.
 pub fn scan_range(cidr: &str, ports: &[u16]) -> Vec<(IpAddr, u16, &'static str)> {
     let Some(hosts) = enumerate_cidr_hosts(cidr) else {
-        eprintln!("[scan] refusing {cidr}: malformed, or wider than a /22 ({MAX_SCAN_HOSTS} hosts)");
+        log::warn!("[scan] refusing {cidr}: malformed, or wider than a /22 ({MAX_SCAN_HOSTS} hosts)");
         return Vec::new();
     };
     let targets: Vec<(Ipv4Addr, u16)> = hosts.iter().flat_map(|&ip| ports.iter().map(move |&p| (ip, p))).collect();

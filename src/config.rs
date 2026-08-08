@@ -9,7 +9,7 @@ pub fn load_list(path: &Path) -> Vec<String> {
     match serde_yaml::from_str::<Vec<String>>(&contents) {
         Ok(list) => list,
         Err(e) => {
-            eprintln!("[config] failed to parse {}: {e}", path.display());
+            log::error!("[config] failed to parse {}: {e}", path.display());
             Vec::new()
         }
     }
@@ -22,7 +22,7 @@ pub fn load_map(path: &Path) -> Vec<(String, String)> {
     match serde_yaml::from_str::<std::collections::HashMap<String, String>>(&contents) {
         Ok(map) => map.into_iter().collect(),
         Err(e) => {
-            eprintln!("[config] failed to parse {}: {e}", path.display());
+            log::error!("[config] failed to parse {}: {e}", path.display());
             Vec::new()
         }
     }
@@ -35,7 +35,7 @@ pub fn load_expiry_map(path: &Path) -> Vec<(String, u64)> {
     match serde_yaml::from_str::<std::collections::HashMap<String, u64>>(&contents) {
         Ok(map) => map.into_iter().collect(),
         Err(e) => {
-            eprintln!("[config] failed to parse {}: {e}", path.display());
+            log::error!("[config] failed to parse {}: {e}", path.display());
             Vec::new()
         }
     }
@@ -52,10 +52,10 @@ pub fn set_expiry_entry(path: &Path, ip: &str, expires_at: u64) {
     match serde_yaml::to_string(&map) {
         Ok(yaml) => {
             if let Err(e) = std::fs::write(path, yaml) {
-                eprintln!("[config] failed to persist {} to {}: {e}", ip, path.display());
+                log::error!("[config] failed to persist {} to {}: {e}", ip, path.display());
             }
         }
-        Err(e) => eprintln!("[config] failed to serialize {}: {e}", path.display()),
+        Err(e) => log::error!("[config] failed to serialize {}: {e}", path.display()),
     }
 }
 
@@ -87,7 +87,7 @@ pub fn load_cannon_config(path: &Path) -> CannonConfig {
     match serde_yaml::from_str(&contents) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("[config] failed to parse {}: {e}", path.display());
+            log::error!("[config] failed to parse {}: {e}", path.display());
             CannonConfig::default()
         }
     }
@@ -101,7 +101,7 @@ pub fn load_handshake_rules(path: &Path) -> Vec<crate::classify::HandshakeRule> 
     match serde_yaml::from_str(&contents) {
         Ok(rules) => rules,
         Err(e) => {
-            eprintln!("[config] failed to parse {}: {e}", path.display());
+            log::error!("[config] failed to parse {}: {e}", path.display());
             Vec::new()
         }
     }
@@ -114,7 +114,7 @@ pub fn load_asn_ranges(path: &Path) -> Vec<crate::asn::AsnRange> {
     match serde_yaml::from_str(&contents) {
         Ok(ranges) => ranges,
         Err(e) => {
-            eprintln!("[config] failed to parse {}: {e}", path.display());
+            log::error!("[config] failed to parse {}: {e}", path.display());
             Vec::new()
         }
     }

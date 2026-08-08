@@ -201,7 +201,7 @@ impl Engine {
             match inject::Ipv6RstSender::open() {
                 Ok(sender) => Some(sender),
                 Err(e) => {
-                    println!("[inject-v6] disabled: {e}");
+                    log::info!("[inject-v6] disabled: {e}");
                     None
                 }
             }
@@ -213,7 +213,7 @@ impl Engine {
             for (orig, target_host) in &redirect_map {
                 let ip = resolve_ipv4(target_host)
                     .unwrap_or_else(|| panic!("could not resolve redirect target {target_host}"));
-                println!("[redirect] {orig} -> {target_host} ({ip})");
+                log::info!("[redirect] {orig} -> {target_host} ({ip})");
                 map.insert(orig.to_string(), ip);
             }
             Some((map, redirect::open_raw_udp_sender()?))
@@ -226,14 +226,14 @@ impl Engine {
                     let mut map = HashMap::new();
                     for (orig, target_host) in &redirect_map {
                         if let Some(ip) = resolve_ipv6(target_host) {
-                            println!("[redirect-v6] {orig} -> {target_host} ({ip})");
+                            log::info!("[redirect-v6] {orig} -> {target_host} ({ip})");
                             map.insert(orig.to_string(), ip);
                         }
                     }
                     Some((map, sender))
                 }
                 Err(e) => {
-                    println!("[redirect-v6] disabled: {e}");
+                    log::info!("[redirect-v6] disabled: {e}");
                     None
                 }
             }
@@ -241,49 +241,49 @@ impl Engine {
             None
         };
         for s in &blocked_sni {
-            println!("[block-sni] {s}");
+            log::info!("[block-sni] {s}");
         }
         for h in &blocked_ja3 {
-            println!("[block-ja3] {h}");
+            log::info!("[block-ja3] {h}");
         }
         for h in &blocked_ja3s {
-            println!("[block-ja3s] {h}");
+            log::info!("[block-ja3s] {h}");
         }
         for h in &blocked_ja4 {
-            println!("[block-ja4] {h}");
+            log::info!("[block-ja4] {h}");
         }
         for (ip, ttl) in &blocked_ip {
             match ttl {
-                Some(d) => println!("[block-ip] {ip} (expires in {}s)", d.as_secs()),
-                None => println!("[block-ip] {ip}"),
+                Some(d) => log::info!("[block-ip] {ip} (expires in {}s)", d.as_secs()),
+                None => log::info!("[block-ip] {ip}"),
             }
         }
         for s in &signatures {
-            println!("[block-sig] {s}");
+            log::info!("[block-sig] {s}");
         }
         for r in &handshake_rules {
-            println!("[handshake] {} (length={:?}, {} anchors)", r.name, r.length, r.anchors.len());
+            log::info!("[handshake] {} (length={:?}, {} anchors)", r.name, r.length, r.anchors.len());
         }
         if cannon_enabled {
-            println!("[cannon] hosts={:?} marker={:?} redirect={:?}", cannon.hosts, cannon.marker, cannon.redirect);
+            log::info!("[cannon] hosts={:?} marker={:?} redirect={:?}", cannon.hosts, cannon.marker, cannon.redirect);
         }
         for (ip, d) in &lockdown_ips {
-            println!("[lockdown] {ip} (expires in {}s)", d.as_secs());
+            log::info!("[lockdown] {ip} (expires in {}s)", d.as_secs());
         }
         if block_ech {
-            println!("[block-ech] blocking on encrypted_client_hello presence alone (no SNI to name)");
+            log::info!("[block-ech] blocking on encrypted_client_hello presence alone (no SNI to name)");
         }
         if block_quic {
-            println!("[block-quic] blanket-dropping UDP:443 - QUIC forced to fall back to TCP+TLS");
+            log::info!("[block-quic] blanket-dropping UDP:443 - QUIC forced to fall back to TCP+TLS");
         }
         if allowlist_only {
-            println!("[allowlist-only] default-deny mode: {} entries, everything else blocked", allowlist.len());
+            log::info!("[allowlist-only] default-deny mode: {} entries, everything else blocked", allowlist.len());
         }
         for asn in &blocked_asn {
-            println!("[block-asn] AS{asn} ({} ranges loaded)", asn_ranges.len());
+            log::info!("[block-asn] AS{asn} ({} ranges loaded)", asn_ranges.len());
         }
         if block_doh {
-            println!("[block-doh] blocking on known DoH/DoT resolver IP match ({} providers loaded)", doh_providers.len());
+            log::info!("[block-doh] blocking on known DoH/DoT resolver IP match ({} providers loaded)", doh_providers.len());
         }
         let now = Instant::now();
         let blocked_ip = blocked_ip.into_iter().map(|(ip, ttl)| (ip, ttl.map(|d| now + d))).collect();
@@ -342,7 +342,7 @@ impl Engine {
         let offset = ip.get_fragment_offset() as usize * 8; // wire units are 8-byte blocks
         let more = ip.get_flags() & Ipv4Flags::MoreFragments != 0;
         if let Some(reassembled) = self.ip4_fragments.insert(key, offset, more, ip.payload()) {
-            println!("  [detect] ip-fragment-reassembled {src} -> {dst} (proto={}, {} bytes)", proto.0, reassembled.len());
+            log::info!("  [detect] ip-fragment-reassembled {src} -> {dst} (proto={}, {} bytes)", proto.0, reassembled.len());
             self.dispatch(IpAddr::V4(src), IpAddr::V4(dst), proto, &reassembled);
         }
     }
@@ -361,7 +361,7 @@ impl Engine {
         let key = (src, dst, frag.id);
         let offset = frag.offset as usize * 8;
         if let Some(reassembled) = self.ip6_fragments.insert(key, offset, frag.more_fragments, payload) {
-            println!("  [detect] ip-fragment-reassembled {src} -> {dst} (proto={}, {} bytes)", proto.0, reassembled.len());
+            log::info!("  [detect] ip-fragment-reassembled {src} -> {dst} (proto={}, {} bytes)", proto.0, reassembled.len());
             self.dispatch(IpAddr::V6(src), IpAddr::V6(dst), proto, &reassembled);
         }
     }
@@ -380,7 +380,7 @@ impl Engine {
             }
             other => {
                 if self.trace {
-                    println!("IP   {src} -> {dst}  proto={other:?}");
+                    log::debug!("IP   {src} -> {dst}  proto={other:?}");
                 }
             }
         }
@@ -393,7 +393,7 @@ impl Engine {
         let (kept, expired): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.blocked_ip).into_iter().partition(|(_, exp)| exp.is_none_or(|e| now < e));
         for (ip, _) in &expired {
-            println!("  [escalate] {ip} block expired");
+            log::info!("  [escalate] {ip} block expired");
         }
         self.blocked_ip = kept;
     }
@@ -409,9 +409,9 @@ impl Engine {
         if self.lockdown_ips.len() != before {
             let ips: Vec<String> = self.lockdown_ips.iter().map(|(ip, _)| ip.clone()).collect();
             if let Err(e) = lockdown::apply_all(&ips, self.block_quic) {
-                eprintln!("[lockdown] failed to update firewall rules after expiry: {e}");
+                log::error!("[lockdown] failed to update firewall rules after expiry: {e}");
             }
-            println!("  [lockdown] expired entries removed, firewall rules updated");
+            log::info!("  [lockdown] expired entries removed, firewall rules updated");
         }
     }
 
@@ -492,8 +492,8 @@ impl Engine {
                     let body = cannon::build_http_response(&self.cannon.marker, self.cannon.redirect.as_deref());
                     if let Some(tx) = self.injector.as_mut() {
                         match cannon::inject_response(tx, server4, dport, client4, sport, server_seq, client_seq_after, &body) {
-                            Ok(()) => println!("  [cannon] injected response to {src}:{sport} -> {dst}:{dport}"),
-                            Err(e) => eprintln!("  [cannon] failed: {e}"),
+                            Ok(()) => log::info!("  [cannon] injected response to {src}:{sport} -> {dst}:{dport}"),
+                            Err(e) => log::error!("  [cannon] failed: {e}"),
                         }
                     }
                 }
@@ -517,7 +517,7 @@ impl Engine {
             state.tls_segment_count += 1;
             if state.tls_segment_count > FRAGMENTATION_SEGMENT_THRESHOLD {
                 state.fragmentation_flagged = true;
-                println!("  [detect] possible-fragmentation-evasion on {src}:{sport} -> {dst}:{dport}");
+                log::info!("  [detect] possible-fragmentation-evasion on {src}:{sport} -> {dst}:{dport}");
                 if self.lockdown_enabled {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "possible-fragmentation-evasion");
                 }
@@ -531,7 +531,7 @@ impl Engine {
         if !state.ip_checked {
             state.ip_checked = true;
             if self.blocked_ip.iter().any(|(rule, _)| ip_rule_matches(rule, &src) || ip_rule_matches(rule, &dst)) {
-                println!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport}");
+                log::info!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport}");
                 block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ip", "");
                 if self.lockdown_enabled {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "ip");
@@ -541,7 +541,7 @@ impl Engine {
                 // allowlist, so it's blocked regardless of the (irrelevant
                 // in this mode) blocked_ip list. IP/CIDR only for now - SNI
                 // isn't known yet at this point in the flow.
-                println!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport} (not on allowlist)");
+                log::info!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport} (not on allowlist)");
                 block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "allowlist", "");
                 if self.lockdown_enabled {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "allowlist");
@@ -551,7 +551,7 @@ impl Engine {
                     crate::asn::asn_for_ip(&self.asn_ranges, &ip).filter(|asn| self.blocked_asn.contains(asn)).map(|asn| (ip, asn))
                 });
                 if let Some((_, asn)) = hit {
-                    println!("  [asn] blocked flow {src}:{sport} -> {dst}:{dport} (AS{asn})");
+                    log::info!("  [asn] blocked flow {src}:{sport} -> {dst}:{dport} (AS{asn})");
                     block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "asn", &asn.to_string());
                     if self.lockdown_enabled {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "asn");
@@ -565,7 +565,7 @@ impl Engine {
         let scan_from = state.sig_scanned_len.saturating_sub(SIG_SCAN_OVERLAP);
         let scan_buf = &state.stream.delivered[scan_from.min(state.stream.delivered.len())..];
         for hit in self.sigs.matches(scan_buf) {
-            println!("  [signature] {hit} in {src}:{sport} -> {dst}:{dport}");
+            log::info!("  [signature] {hit} in {src}:{sport} -> {dst}:{dport}");
             block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "signature", hit);
             if self.lockdown_enabled {
                 lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "signature");
@@ -585,7 +585,7 @@ impl Engine {
                 .filter(|r| classify::rule_applies_to(r, "tcp"))
                 .find(|r| classify::matches_handshake(&state.stream.delivered, r))
             {
-                println!("  [detect] {} on {src}:{sport} -> {dst}:{dport}", rule.name);
+                log::info!("  [detect] {} on {src}:{sport} -> {dst}:{dport}", rule.name);
                 state.handshake_checked = true;
                 if self.lockdown_enabled {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, &rule.name);
@@ -607,8 +607,8 @@ impl Engine {
                 if let Some((ja3_string, hash)) = ja3(buf) {
                     let label = KNOWN_JA3.iter().find(|(h, _)| *h == hash).map(|(_, l)| *l);
                     match label {
-                        Some(l) => println!("  [ja3] {src}:{sport} -> {dst}:{dport}  ja3={hash} client={l} ({ja3_string})"),
-                        None => println!("  [ja3] {src}:{sport} -> {dst}:{dport}  ja3={hash} client=unknown ({ja3_string})"),
+                        Some(l) => log::info!("  [ja3] {src}:{sport} -> {dst}:{dport}  ja3={hash} client={l} ({ja3_string})"),
+                        None => log::info!("  [ja3] {src}:{sport} -> {dst}:{dport}  ja3={hash} client=unknown ({ja3_string})"),
                     }
                     if self.blocked_ja3.iter().any(|h| h == &hash) {
                         block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja3", &hash);
@@ -618,7 +618,7 @@ impl Engine {
                     }
                 }
                 if let Some(ja4_fp) = classify::ja4(buf) {
-                    println!("  [ja4] {src}:{sport} -> {dst}:{dport}  ja4={ja4_fp}");
+                    log::info!("  [ja4] {src}:{sport} -> {dst}:{dport}  ja4={ja4_fp}");
                     if self.blocked_ja4.iter().any(|h| h == &ja4_fp) {
                         block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja4", &ja4_fp);
                         if self.lockdown_enabled {
@@ -627,7 +627,7 @@ impl Engine {
                     }
                 }
                 if let Some((_, name)) = self.doh_providers.iter().find(|(rule, _)| ip_rule_matches(rule, &dst)) {
-                    println!("  [doh] {src}:{sport} -> {dst}:{dport}  known DoH/DoT resolver ({name})");
+                    log::info!("  [doh] {src}:{sport} -> {dst}:{dport}  known DoH/DoT resolver ({name})");
                     if self.block_doh {
                         block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "doh", name);
                         if self.lockdown_enabled {
@@ -645,7 +645,7 @@ impl Engine {
                     // unconditionally - it does NOT fall through to the SNI
                     // branch below even when ch.sni is Some.
                     let outer = ch.sni.as_deref().unwrap_or("none");
-                    println!("  [ech] {src}:{sport} -> {dst}:{dport}  encrypted_client_hello present, outer/cover sni={outer} (real destination hidden)");
+                    log::info!("  [ech] {src}:{sport} -> {dst}:{dport}  encrypted_client_hello present, outer/cover sni={outer} (real destination hidden)");
                     if self.block_ech {
                         block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ech", outer);
                         if self.lockdown_enabled {
@@ -653,7 +653,7 @@ impl Engine {
                         }
                     }
                 } else if let Some(name) = ch.sni {
-                    println!("  [sni] {src}:{sport} -> {dst}:{dport}  server_name={name}");
+                    log::info!("  [sni] {src}:{sport} -> {dst}:{dport}  server_name={name}");
                     if self.blocked_sni.iter().any(|s| s == &name) {
                         block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "sni", &name);
                         if self.lockdown_enabled {
@@ -666,17 +666,17 @@ impl Engine {
             } else if state.saw_syn && buf.len() >= CLIENTHELLO_CAP {
                 let candidate_port = if TLS_LIKE_PORTS.contains(&dport) { dport } else { sport };
                 if let Some(label) = classify_first_segment(buf, candidate_port) {
-                    println!("  [detect] {label} on {src}:{sport} -> {dst}:{dport}");
+                    log::info!("  [detect] {label} on {src}:{sport} -> {dst}:{dport}");
                     // Probe only against allow-listed hosts; no target -> trust the heuristic.
                     let confirmed = match [src, dst].into_iter().find(|ip| self.probe_targets.iter().any(|r| ip_rule_matches(r, ip))) {
                         None => true,
                         Some(target) => match probe::probe(target, candidate_port) {
                             Some(proto) => {
-                                println!("  [probe] confirmed {proto} on {target}:{candidate_port}");
+                                log::info!("  [probe] confirmed {proto} on {target}:{candidate_port}");
                                 true
                             }
                             None => {
-                                println!("  [probe] no known protocol matched on {target}:{candidate_port} - not blocking");
+                                log::info!("  [probe] no known protocol matched on {target}:{candidate_port} - not blocking");
                                 false
                             }
                         },
@@ -699,7 +699,7 @@ impl Engine {
         // could in principle split across segments).
         if !state.host_checked && !state.stream.delivered.is_empty() {
             if let Some(name) = classify::parse_http_host(&state.stream.delivered) {
-                println!("  [host] {src}:{sport} -> {dst}:{dport}  host={name}");
+                log::info!("  [host] {src}:{sport} -> {dst}:{dport}  host={name}");
                 if self.blocked_sni.iter().any(|s| s == &name) {
                     block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "host", &name);
                     if self.lockdown_enabled {
@@ -719,7 +719,7 @@ impl Engine {
         // TLS 1.3 naturally never matches here (message is encrypted).
         if !state.cert_checked && !state.stream.delivered.is_empty() {
             if let Some(names) = classify::parse_tls_certificate_names(&state.stream.delivered) {
-                println!("  [cert] {src}:{sport} -> {dst}:{dport}  names={names:?}");
+                log::info!("  [cert] {src}:{sport} -> {dst}:{dport}  names={names:?}");
                 if names.iter().any(|n| self.blocked_sni.iter().any(|s| s == n)) {
                     block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "cert", &names.join(","));
                     if self.lockdown_enabled {
@@ -742,7 +742,7 @@ impl Engine {
         // regardless of what hostname the client asked for.
         if !state.ja3s_checked && !state.stream.delivered.is_empty() {
             if let Some((ja3s_string, hash)) = classify::ja3s(&state.stream.delivered) {
-                println!("  [ja3s] {src}:{sport} -> {dst}:{dport}  ja3s={hash} ({ja3s_string})");
+                log::info!("  [ja3s] {src}:{sport} -> {dst}:{dport}  ja3s={hash} ({ja3s_string})");
                 if self.blocked_ja3s.iter().any(|h| h == &hash) {
                     block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja3s", &hash);
                     if self.lockdown_enabled {
@@ -760,7 +760,7 @@ impl Engine {
         // the client->server direction (the one carrying the preface).
         if !state.h2_authority_checked && !state.stream.delivered.is_empty() {
             if let Some(name) = h2::extract_authority(&state.stream.delivered) {
-                println!("  [h2-authority] {src}:{sport} -> {dst}:{dport}  authority={name}");
+                log::info!("  [h2-authority] {src}:{sport} -> {dst}:{dport}  authority={name}");
                 if self.blocked_sni.iter().any(|s| s == &name) {
                     block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "h2-authority", &name);
                     if self.lockdown_enabled {
@@ -774,11 +774,11 @@ impl Engine {
         }
 
         if let Some(label) = state.timing.check() {
-            println!("  [timing] {label} on {src}:{sport} -> {dst}:{dport}");
+            log::info!("  [timing] {label} on {src}:{sport} -> {dst}:{dport}");
         }
 
         if self.trace {
-            println!(
+            log::debug!(
                 "TCP  {src}:{sport} -> {dst}:{dport}  len={len}  reassembled={total}",
                 len = payload.len(),
                 total = state.stream.delivered.len(),
@@ -798,15 +798,15 @@ impl Engine {
             timing.record(payload.len());
         }
         if let Some(label) = timing.check() {
-            println!("  [timing] {label} on {src}:{sport} -> {dst}:{dport}");
+            log::info!("  [timing] {label} on {src}:{sport} -> {dst}:{dport}");
         }
 
         // Default-deny mode, UDP side: no RST-equivalent for UDP (see the
         // handshake-rule branch below), so this is lockdown-only, and only
-        // fires once per flow (a println! per packet would flood the log).
+        // fires once per flow (a log line per packet would flood the log).
         if self.allowlist_only && !self.allowlist.iter().any(|rule| ip_rule_matches(rule, &src) || ip_rule_matches(rule, &dst)) {
             if self.udp_allowlist_logged.insert(key) {
-                println!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport} (not on allowlist)");
+                log::info!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport} (not on allowlist)");
             }
             if self.lockdown_enabled {
                 lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "allowlist");
@@ -816,27 +816,27 @@ impl Engine {
         // dport==53: this is a client's outbound query to a resolver at `dst`.
         if dport == 53 {
             if let Some(query) = parse_dns_query_full(payload) {
-                println!("  [dns] {src}:{sport} -> {dst}:{dport}  query={}", query.name);
+                log::info!("  [dns] {src}:{sport} -> {dst}:{dport}  query={}", query.name);
                 if let (Some((map, tx)), IpAddr::V4(dst4), IpAddr::V4(src4)) = (self.dns_redirect.as_mut(), dst, src) {
                     if let Some(&answer_ip) = map.get(&query.name) {
                         match redirect::send_dns_redirect_flood(tx, dst4, src4, sport, &query, answer_ip) {
-                            Ok(()) => println!("  [redirect] spoofed A record {} -> {answer_ip}", query.name),
-                            Err(e) => eprintln!("  [redirect] failed: {e}"),
+                            Ok(()) => log::info!("  [redirect] spoofed A record {} -> {answer_ip}", query.name),
+                            Err(e) => log::error!("  [redirect] failed: {e}"),
                         }
                     }
                 }
                 if let (Some((map, tx)), IpAddr::V6(dst6), IpAddr::V6(src6)) = (self.dns_redirect_v6.as_ref(), dst, src) {
                     if let Some(&answer_ip) = map.get(&query.name) {
                         match redirect::send_dns_redirect_v6_flood(tx, dst6, src6, sport, &query, answer_ip) {
-                            Ok(()) => println!("  [redirect] spoofed AAAA record {} -> {answer_ip}", query.name),
-                            Err(e) => eprintln!("  [redirect] failed: {e}"),
+                            Ok(()) => log::info!("  [redirect] spoofed AAAA record {} -> {answer_ip}", query.name),
+                            Err(e) => log::error!("  [redirect] failed: {e}"),
                         }
                     }
                 }
             }
         } else if sport == 53 {
             if let Some(name) = parse_dns_query_full(payload).map(|q| q.name) {
-                println!("  [dns] {src}:{sport} -> {dst}:{dport}  query={name}");
+                log::info!("  [dns] {src}:{sport} -> {dst}:{dport}  query={name}");
             }
         } else if dport == 5353 || sport == 5353 {
             // mDNS (RFC 6762) - same wire format as unicast DNS, reuse the
@@ -844,7 +844,7 @@ impl Engine {
             // an answer to the way --redirect-dns does for unicast :53 -
             // detection/log only.
             if let Some(query) = parse_dns_query_full(payload) {
-                println!("  [mdns] {src}:{sport} -> {dst}:{dport}  query={}", query.name);
+                log::info!("  [mdns] {src}:{sport} -> {dst}:{dport}  query={}", query.name);
             }
         } else if dport == 443 || sport == 443 {
             // QUIC Initial packets are decryptable without keys - RFC 9001 §5.2
@@ -853,7 +853,7 @@ impl Engine {
             // data) stays opaque, same blind spot as post-handshake TCP TLS.
             if let Some(record) = crate::quic::decrypt_initial_client_hello_record(payload) {
                 if let Some((ja3_string, hash)) = ja3(&record) {
-                    println!("  [quic-ja3] {src}:{sport} -> {dst}:{dport}  ja3={hash} ({ja3_string})");
+                    log::info!("  [quic-ja3] {src}:{sport} -> {dst}:{dport}  ja3={hash} ({ja3_string})");
                     if self.blocked_ja3.iter().any(|h| h == &hash) {
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja3");
@@ -861,13 +861,13 @@ impl Engine {
                     }
                 }
                 if let Some(ja4_fp) = classify::ja4(&record) {
-                    println!("  [quic-ja4] {src}:{sport} -> {dst}:{dport}  ja4={ja4_fp}");
+                    log::info!("  [quic-ja4] {src}:{sport} -> {dst}:{dport}  ja4={ja4_fp}");
                     if self.blocked_ja4.iter().any(|h| h == &ja4_fp) && self.lockdown_enabled {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja4");
                     }
                 }
                 if let Some(name) = classify::parse_sni(&record) {
-                    println!("  [quic-sni] {src}:{sport} -> {dst}:{dport}  server_name={name}");
+                    log::info!("  [quic-sni] {src}:{sport} -> {dst}:{dport}  server_name={name}");
                     if self.blocked_sni.iter().any(|s| s == &name) && self.lockdown_enabled {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "sni");
                     }
@@ -888,13 +888,13 @@ impl Engine {
             // as obfs4 - see detect.rs). UDP has no RST equivalent, so
             // --inject doesn't apply here; --lockdown (IP-level,
             // protocol-agnostic) does.
-            println!("  [detect] {} on {src}:{sport} -> {dst}:{dport}", rule.name);
+            log::info!("  [detect] {} on {src}:{sport} -> {dst}:{dport}", rule.name);
             if self.lockdown_enabled {
                 lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, &rule.name);
             }
         }
         if self.trace {
-            println!("UDP  {src}:{sport} -> {dst}:{dport}  len={len}", len = payload.len());
+            log::debug!("UDP  {src}:{sport} -> {dst}:{dport}  len={len}", len = payload.len());
         }
     }
 }
@@ -933,12 +933,12 @@ fn try_reset(
     };
     match result {
         Ok(()) => {
-            println!("  [inject] RST sent both directions ({reason})");
+            log::info!("  [inject] RST sent both directions ({reason})");
             *stats.lock().unwrap().entry(kind.to_string()).or_insert(0) += 1;
             true
         }
         Err(e) => {
-            eprintln!("  [inject] failed: {e}");
+            log::error!("  [inject] failed: {e}");
             false
         }
     }
@@ -975,7 +975,7 @@ fn block(
     let (count, _) = *entry;
     let src_s = src.to_string();
     if count >= ESCALATE_THRESHOLD && !blocked_ip.iter().any(|(ip, _)| ip == &src_s) {
-        println!("  [escalate] auto-blocking {src_s} after {count} offenses in {ESCALATE_WINDOW:?} (expires in {ESCALATION_TTL:?}, persisted)");
+        log::info!("  [escalate] auto-blocking {src_s} after {count} offenses in {ESCALATE_WINDOW:?} (expires in {ESCALATION_TTL:?}, persisted)");
         let expires_at = std::time::SystemTime::now() + ESCALATION_TTL;
         let epoch = expires_at.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         crate::config::set_expiry_entry(std::path::Path::new(ESCALATED_IP_FILE), &src_s, epoch);
@@ -995,13 +995,13 @@ fn lockdown_on_match(lockdown_ips: &mut Vec<(String, Instant)>, block_quic: bool
     lockdown_ips.push((src_s.clone(), Instant::now() + LOCKDOWN_TTL));
     let ips: Vec<String> = lockdown_ips.iter().map(|(ip, _)| ip.clone()).collect();
     if let Err(e) = lockdown::apply_all(&ips, block_quic) {
-        eprintln!("  [lockdown] failed to apply firewall rule for {src_s}: {e}");
+        log::error!("  [lockdown] failed to apply firewall rule for {src_s}: {e}");
         lockdown_ips.pop(); // roll back - firewall state and our list must agree
         return;
     }
     let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + LOCKDOWN_TTL.as_secs();
     crate::config::set_expiry_entry(std::path::Path::new(LOCKDOWN_FILE), &src_s, epoch);
-    println!("  [lockdown] {src_s} blocked at firewall level ({kind} match, expires in {LOCKDOWN_TTL:?})");
+    log::info!("  [lockdown] {src_s} blocked at firewall level ({kind} match, expires in {LOCKDOWN_TTL:?})");
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ const PIPE_BASE: u16 = 100; // arbitrary base unlikely to collide with other dum
 /// (same as everything else here needing raw sockets/system config).
 fn configure_pipe(ip: &str, kbit_s: u32, pipe_num: u16) -> std::io::Result<()> {
     run(&["dnctl", "pipe", &pipe_num.to_string(), "config", "bw", &format!("{kbit_s}Kbit/s")])?;
-    println!("[throttle] {ip} limited to {kbit_s}Kbit/s (pipe {pipe_num})");
+    log::info!("[throttle] {ip} limited to {kbit_s}Kbit/s (pipe {pipe_num})");
     Ok(())
 }
 
@@ -30,14 +30,14 @@ pub fn apply_all(entries: &[(String, u32)]) {
     for (i, (ip, kbit_s)) in entries.iter().enumerate() {
         let pipe_num = PIPE_BASE + i as u16;
         if let Err(e) = configure_pipe(ip, *kbit_s, pipe_num) {
-            eprintln!("[throttle] failed to configure pipe for {ip}: {e}");
+            log::error!("[throttle] failed to configure pipe for {ip}: {e}");
             continue;
         }
         rule.push_str(&format!("dummynet quick from {ip} to any pipe {pipe_num}\ndummynet quick from any to {ip} pipe {pipe_num}\n"));
     }
     if !rule.is_empty() {
         if let Err(e) = load_anchor_rule(&rule) {
-            eprintln!("[throttle] failed to load anchor rules: {e}");
+            log::error!("[throttle] failed to load anchor rules: {e}");
         }
     }
 }
@@ -59,8 +59,8 @@ fn load_anchor_rule(rule: &str) -> std::io::Result<()> {
 pub fn clear_all() {
     let result = Command::new("pfctl").args(["-a", ANCHOR, "-F", "all"]).status();
     match result {
-        Ok(status) if status.success() => println!("[throttle] cleared anchor rules"),
-        _ => eprintln!("[throttle] failed to clear anchor rules - check manually: sudo pfctl -a {ANCHOR} -F all"),
+        Ok(status) if status.success() => log::info!("[throttle] cleared anchor rules"),
+        _ => log::error!("[throttle] failed to clear anchor rules - check manually: sudo pfctl -a {ANCHOR} -F all"),
     }
 }
 

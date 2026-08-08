@@ -100,8 +100,8 @@ fn load_anchor_rule(rule: &str) -> std::io::Result<()> {
 pub fn clear_all() {
     let result = Command::new("pfctl").args(["-a", ANCHOR, "-F", "all"]).status();
     match result {
-        Ok(status) if status.success() => println!("[lockdown] cleared anchor rules"),
-        _ => eprintln!("[lockdown] failed to clear anchor rules - check manually: sudo pfctl -a {ANCHOR} -F all"),
+        Ok(status) if status.success() => log::info!("[lockdown] cleared anchor rules"),
+        _ => log::error!("[lockdown] failed to clear anchor rules - check manually: sudo pfctl -a {ANCHOR} -F all"),
     }
 }
 

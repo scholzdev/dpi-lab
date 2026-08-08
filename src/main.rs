@@ -128,7 +128,7 @@ fn run_inline(args: &[String]) {
     let handshake_rules = config::load_handshake_rules(&config_dir.join("handshakes.yml"));
     let downgrade_tls13 = args.iter().any(|a| a == "--downgrade-tls13");
     if downgrade_tls13 {
-        println!("[inline] --downgrade-tls13: forcing TLS 1.3 ClientHellos to 1.2 - RFC 8446 SS4.1.3's downgrade sentinel means any conformant modern client detects and aborts this rather than silently downgrading (see example.md)");
+        log::info!("[inline] --downgrade-tls13: forcing TLS 1.3 ClientHellos to 1.2 - RFC 8446 SS4.1.3's downgrade sentinel means any conformant modern client detects and aborts this rather than silently downgrading (see example.md)");
     }
 
     let classifier = inline::InlineClassifier {
@@ -147,7 +147,7 @@ fn run_inline(args: &[String]) {
     .expect("failed to set Ctrl-C handler");
 
     if let Err(e) = inline::run(&classifier) {
-        eprintln!("[inline] fatal: {e} (needs root + nft on PATH)");
+        log::error!("[inline] fatal: {e} (needs root + nft on PATH)");
         inline::clear_nft();
         std::process::exit(1);
     }
@@ -155,7 +155,7 @@ fn run_inline(args: &[String]) {
 
 #[cfg(not(target_os = "linux"))]
 fn run_inline(_args: &[String]) {
-    eprintln!("--inline needs Linux (NFQUEUE) - not available on this platform. Use passive capture mode instead.");
+    log::error!("--inline needs Linux (NFQUEUE) - not available on this platform. Use passive capture mode instead.");
     std::process::exit(1);
 }
 
@@ -171,7 +171,7 @@ const DEFAULT_SCAN_PORTS: [u16; 4] = [80, 443, 1080, 8080]; // http, https, comm
 fn run_scan(cidr: &str, args: &[String]) {
     let allowed = config::load_list(Path::new("config").join("probe_targets.yml").as_path());
     if !allowed.iter().any(|entry| entry == cidr) {
-        eprintln!(
+        log::warn!(
             "[scan] refusing {cidr}: not a literal entry in config/probe_targets.yml - \
              add it there first (own lab ranges only, never a third-party network)"
         );
@@ -200,6 +200,11 @@ fn flag_values(args: &[String], flag: &str) -> Vec<String> {
 }
 
 fn main() {
+    // RUST_LOG controls verbosity (e.g. RUST_LOG=debug for --trace-adjacent
+    // detail, RUST_LOG=warn to quiet down); "info" by default so a plain run
+    // sees everything it used to unconditionally print before this existed.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--inline") {
@@ -303,11 +308,11 @@ fn main() {
         }).collect();
     if lockdown_enabled {
         if let Err(e) = lockdown::ensure_hooked() {
-            eprintln!("[lockdown] failed to hook anchor into main ruleset - blocks will not take effect: {e}");
+            log::error!("[lockdown] failed to hook anchor into main ruleset - blocks will not take effect: {e}");
         }
         let ips: Vec<String> = lockdown_ips.iter().map(|(ip, _)| ip.clone()).collect();
         if let Err(e) = lockdown::apply_all(&ips, block_quic) {
-            eprintln!("[lockdown] failed to restore firewall rules at startup: {e}");
+            log::error!("[lockdown] failed to restore firewall rules at startup: {e}");
         }
     }
 
@@ -360,7 +365,7 @@ fn main() {
         let raw = match rx.next() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("capture error: {e}");
+                log::warn!("capture error: {e}");
                 continue;
             }
         };

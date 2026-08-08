@@ -117,8 +117,8 @@ fn setup_nft() -> std::io::Result<()> {
 pub fn clear_nft() {
     let result = std::process::Command::new("nft").args(["delete", "table", "inet", NFT_TABLE]).status();
     match result {
-        Ok(status) if status.success() => println!("[inline] cleared nft table"),
-        _ => eprintln!("[inline] failed to clear nft table - check manually: sudo nft delete table inet {NFT_TABLE}"),
+        Ok(status) if status.success() => log::info!("[inline] cleared nft table"),
+        _ => log::error!("[inline] failed to clear nft table - check manually: sudo nft delete table inet {NFT_TABLE}"),
     }
 }
 
@@ -127,7 +127,7 @@ pub fn clear_nft() {
 /// when --inline is passed, it doesn't run alongside it.
 pub fn run(classifier: &InlineClassifier) -> std::io::Result<()> {
     setup_nft()?;
-    println!("[inline] nft table loaded, queueing FORWARD traffic to queue {QUEUE_NUM}");
+    log::info!("[inline] nft table loaded, queueing FORWARD traffic to queue {QUEUE_NUM}");
 
     let mut queue = Queue::open()?;
     queue.bind(QUEUE_NUM)?;
@@ -136,13 +136,13 @@ pub fn run(classifier: &InlineClassifier) -> std::io::Result<()> {
         let mut msg = queue.recv()?;
         if classifier.downgrade_tls13 {
             if let Some(reason) = mangle_tls13_downgrade(msg.get_payload_mut()) {
-                println!("  [inline] {reason}");
+                log::info!("[inline] {reason}");
             }
         }
         let payload = msg.get_payload();
         let verdict = decide(classifier, payload);
         if let Some(reason) = &verdict {
-            println!("  [inline] dropped ({reason})");
+            log::info!("[inline] dropped ({reason})");
         }
         // get_payload_mut's edits above (if any) are only committed to the
         // kernel on a non-Drop verdict (nfq crate's own doc comment on that

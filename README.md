@@ -79,6 +79,17 @@ restarts; already-expired entries are dropped automatically. Ctrl-C prints a
 block-event summary and clears any throttle/lockdown firewall state before
 exiting.
 
+Logging is via `log`/`env_logger` - `RUST_LOG` controls verbosity
+(`RUST_LOG=info` is the default, matches what used to print unconditionally;
+`RUST_LOG=debug` adds the `--trace` raw-packet dump's detail; `RUST_LOG=warn`
+or `error` quiets it down). Timestamped, leveled lines to stderr, e.g.:
+```
+[2026-08-08T12:23:08Z WARN  dpi_lab] [scan] refusing 10.99.99.0/24: not a literal entry in config/probe_targets.yml
+```
+The block-event summary, `--scan` results, and the interface list stay on
+plain stdout regardless of `RUST_LOG` - those are direct output, not log
+events.
+
 ## Docker
 
 Linux only, either mode (this doesn't relax the platform requirement -
