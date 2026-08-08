@@ -4,6 +4,7 @@ use crate::cannon;
 use crate::classify::{self, ja3, parse_dns_query_full, parse_client_hello, Signatures};
 use crate::config::CannonConfig;
 use crate::detect::{classify_first_segment, TLS_LIKE_PORTS};
+use crate::h2;
 use crate::inject::{self, TransportSender};
 use crate::lockdown;
 use crate::reassembly::TcpStream;
@@ -122,6 +123,7 @@ struct FlowState {
     handshake_checked: bool, // TCP-side structural handshake match (e.g. SSH banner), once per flow
     host_checked: bool, // plaintext HTTP Host: header, once per flow - see classify::parse_http_host
     cert_checked: bool, // TLS <=1.2 Certificate message CN/SAN, once per flow - see classify::parse_tls_certificate_names
+    h2_authority_checked: bool, // HTTP/2 :authority pseudo-header, once per flow - see h2::extract_authority
     last_seen: Instant, // for idle eviction, see prune_idle_flows
     tls_segment_count: u32, // non-empty segments seen on a TLS-like port before ClientHello resolved
     fragmentation_flagged: bool, // single-shot, like checked_entropy - don't spam the log
@@ -413,6 +415,7 @@ impl Engine {
                 handshake_checked: false,
                 host_checked: false,
                 cert_checked: false,
+                h2_authority_checked: false,
                 last_seen: Instant::now(),
                 tls_segment_count: 0,
                 fragmentation_flagged: false,
@@ -659,6 +662,24 @@ impl Engine {
                 // before giving up, still bounded so a non-TLS flow doesn't
                 // get rescanned on every packet forever.
                 state.cert_checked = true;
+            }
+        }
+
+        // HTTP/2's :authority pseudo-header names the destination the way
+        // HTTP/1.1's Host: header does, just HPACK-compressed - only fires on
+        // the client->server direction (the one carrying the preface).
+        if !state.h2_authority_checked && !state.stream.delivered.is_empty() {
+            if let Some(name) = h2::extract_authority(&state.stream.delivered) {
+                println!("  [h2-authority] {src}:{sport} -> {dst}:{dport}  authority={name}");
+                if self.blocked_sni.iter().any(|s| s == &name) {
+                    block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "h2-authority", &name);
+                    if self.lockdown_enabled {
+                        lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "h2-authority");
+                    }
+                }
+                state.h2_authority_checked = true;
+            } else if state.stream.delivered.len() >= CLIENTHELLO_CAP {
+                state.h2_authority_checked = true; // give up - not h2, or headers didn't arrive in one frame
             }
         }
 
@@ -910,6 +931,7 @@ mod tests {
             handshake_checked: false,
             host_checked: false,
                 cert_checked: false,
+                h2_authority_checked: false,
             last_seen: Instant::now(),
             tls_segment_count: 0,
             fragmentation_flagged: false,
@@ -927,6 +949,7 @@ mod tests {
             handshake_checked: false,
             host_checked: false,
                 cert_checked: false,
+                h2_authority_checked: false,
             last_seen: Instant::now(),
             tls_segment_count: 0,
             fragmentation_flagged: false,

@@ -47,6 +47,7 @@ mod classify;
 mod config;
 mod detect;
 mod engine;
+mod h2;
 mod inject;
 mod inline;
 mod lockdown;
