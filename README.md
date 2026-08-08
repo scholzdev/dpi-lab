@@ -103,11 +103,18 @@ sudo ./target/release/dpi-lab eth0 --inject --events-log events.jsonl
 
 then open `http://127.0.0.1:8080`. The editor lists every `config/*.yml`
 file and edits it as JSON (mirrors the YAML shape 1:1 - a flat list stays a
-JSON array, `asn.yml`'s `{cidr,asn,name}` entries stay objects, etc.) -
-**changes take effect on dpi-lab's next restart**, there's no hot-reload.
-The events table polls `/api/events` every 2s, tailing whatever
-`--events-log` file dpi-lab is appending to (empty/no data until dpi-lab is
-actually running with that flag and has blocked something).
+JSON array, `asn.yml`'s `{cidr,asn,name}` entries stay objects, etc.).
+
+**Hot-reload**: `sni`/`ja3`/`ja3s`/`ja4`/`allowlist`/`probe_targets`/`asn`/
+`handshakes`/`doh_providers`/`cannon` are polled and re-read from disk every
+5s while dpi-lab runs - edit through the UI, wait a few seconds, it's live,
+no restart. `ip.yml`/`--block-asn`/lockdown state are **not** hot-reloaded
+(they're merged with `escalated_ip.yml`/CLI flags and actively mutated by
+the auto-escalation logic at runtime - a wholesale reload would fight that)
+- those still need a restart. The events table polls `/api/events` every
+2s, tailing whatever `--events-log` file dpi-lab is appending to (empty/no
+data until dpi-lab is actually running with that flag and has blocked
+something).
 
 No authentication - matches this whole project's single-user/self-hosted
 framing, same as dpi-lab itself. Binds to `127.0.0.1` only by default, so

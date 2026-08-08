@@ -165,7 +165,16 @@ pub struct Engine {
     block_stats: BlockStats,
     escalation: HashMap<IpAddr, (u32, Instant)>, // offense count + window start, per source IP
     events: crate::events::EventLog, // structured JSONL for the web UI's live dashboard, see events.rs
+    config_dir: std::path::PathBuf, // for hot-reload, see maybe_reload_config
+    last_config_reload: Instant,
 }
+
+// Hot-reload poll interval - checked from the same per-packet cadence as
+// prune_idle_flows, not a separate timer/thread. 5s: fast enough that
+// editing a blocklist through the web UI and testing right after feels
+// near-instant, slow enough it's not meaningfully re-parsing YAML on every
+// packet.
+const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 
 impl Engine {
     #[allow(clippy::too_many_arguments)]
@@ -197,6 +206,7 @@ impl Engine {
         trace: bool,
         block_stats: BlockStats,
         events_log_path: Option<std::path::PathBuf>,
+        config_dir: std::path::PathBuf,
     ) -> std::io::Result<Self> {
         let injector = if inject_enabled { Some(inject::open_raw_sender()?) } else { None };
         let injector_v6 = if inject_enabled {
@@ -325,6 +335,8 @@ impl Engine {
             block_stats,
             escalation: HashMap::new(),
             events: crate::events::EventLog::new(events_log_path),
+            config_dir,
+            last_config_reload: Instant::now(),
         })
     }
 
@@ -429,6 +441,48 @@ impl Engine {
         self.udp_allowlist_logged.retain(|k| live.contains_key(k));
         self.ip4_fragments.prune(IDLE_TIMEOUT);
         self.ip6_fragments.prune(IDLE_TIMEOUT);
+        self.maybe_reload_config();
+    }
+
+    /// Re-read the subset of config/*.yml that's safe to swap wholesale at
+    /// runtime - the simple blocklists/lookup tables the web UI edits.
+    /// Explicitly NOT included: blocked_ip (merges escalated_ip.yml +
+    /// CLI --block-ip + live auto-escalation - a wholesale reload would
+    /// fight the escalation logic actively mutating it), blocked_asn
+    /// (CLI-only, no file to reload from), lockdown_ips (same runtime-
+    /// mutation concern as blocked_ip). Checked every `prune_idle_flows`
+    /// call (same per-packet cadence as everything else in there), not a
+    /// separate timer/thread - polling, not filesystem-watching (no new
+    /// dependency for this).
+    ///
+    /// ponytail: CLI-flag-supplied extras (`--block-sni foo` etc.) get
+    /// silently dropped on the first reload - the flag's value was already
+    /// merged into the Vec once at startup and this doesn't remember which
+    /// entries came from where. Documented, not hidden: this feature's
+    /// primary use case (editing via the web UI) doesn't typically combine
+    /// with CLI blocklist flags in the same run.
+    fn maybe_reload_config(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_config_reload) < CONFIG_RELOAD_INTERVAL {
+            return;
+        }
+        self.last_config_reload = now;
+
+        self.blocked_sni = crate::config::load_list(&self.config_dir.join("sni.yml"));
+        self.blocked_ja3 = crate::config::load_list(&self.config_dir.join("ja3.yml"));
+        self.blocked_ja3s = crate::config::load_list(&self.config_dir.join("ja3s.yml"));
+        self.blocked_ja4 = crate::config::load_list(&self.config_dir.join("ja4.yml"));
+        self.allowlist = crate::config::load_list(&self.config_dir.join("allowlist.yml"));
+        self.probe_targets = crate::config::load_list(&self.config_dir.join("probe_targets.yml"));
+        self.asn_ranges = crate::config::load_asn_ranges(&self.config_dir.join("asn.yml"));
+        self.handshake_rules = crate::config::load_handshake_rules(&self.config_dir.join("handshakes.yml"));
+        self.doh_providers = crate::config::load_map(&self.config_dir.join("doh_providers.yml"));
+        self.cannon = crate::config::load_cannon_config(&self.config_dir.join("cannon.yml"));
+
+        let signatures = crate::config::load_list(&self.config_dir.join("signatures.yml"));
+        self.sigs = Signatures::new(&signatures);
+
+        log::debug!("[reload] config refreshed from {}", self.config_dir.display());
     }
 
     fn handle_tcp(&mut self, src: IpAddr, dst: IpAddr, tcp: &TcpPacket) {
@@ -1029,7 +1083,7 @@ mod tests {
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
-        ], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None)
+        ], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None, std::path::PathBuf::from("config"))
         .unwrap();
         std::thread::sleep(Duration::from_millis(5)); // let the zero-TTL entry actually pass
         engine.prune_expired_ips();
@@ -1039,7 +1093,7 @@ mod tests {
 
     #[test]
     fn prune_idle_flows_drops_stale_entries() {
-        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None)
+        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None, std::path::PathBuf::from("config"))
         .unwrap();
         let stale_key = ("10.0.0.1".parse().unwrap(), 1, "10.0.0.2".parse().unwrap(), 2);
         let fresh_key = ("10.0.0.3".parse().unwrap(), 3, "10.0.0.4".parse().unwrap(), 4);
@@ -1116,5 +1170,36 @@ mod tests {
     fn cidr_ignores_ipv6() {
         let ip: IpAddr = "::1".parse().unwrap();
         assert!(!ip_rule_matches("10.27.0.0/24", &ip));
+    }
+
+    #[test]
+    fn reload_picks_up_a_changed_blocklist_after_the_interval() {
+        let dir = std::env::temp_dir().join("dpi-lab-test-reload");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sni.yml"), "- original.example\n").unwrap();
+
+        let mut engine =
+            Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None, dir.clone())
+                .unwrap();
+        // Engine::new's blocked_sni param is independent of config_dir (main.rs
+        // loads it once itself and passes the Vec in) - starts empty here since
+        // the test passes vec![]. config_dir only feeds maybe_reload_config.
+        assert_eq!(engine.blocked_sni, Vec::<String>::new());
+
+        // Too soon - within CONFIG_RELOAD_INTERVAL, must not re-read yet even
+        // though the file on disk changed.
+        std::fs::write(dir.join("sni.yml"), "- changed.example\n").unwrap();
+        engine.maybe_reload_config();
+        assert_eq!(engine.blocked_sni, Vec::<String>::new());
+
+        // Backdate the last-reload clock past the interval - same technique
+        // as prune_idle_flows_drops_stale_entries above for testing a
+        // time-gated check without a real sleep.
+        engine.last_config_reload = Instant::now() - CONFIG_RELOAD_INTERVAL - Duration::from_secs(1);
+        engine.maybe_reload_config();
+        assert_eq!(engine.blocked_sni, vec!["changed.example"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

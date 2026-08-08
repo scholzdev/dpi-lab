@@ -356,6 +356,7 @@ fn main() {
         trace,
         block_stats,
         events_log_path,
+        config_dir.to_path_buf(),
     )
     .expect("open raw socket for --inject/--redirect-dns (need root)");
 
