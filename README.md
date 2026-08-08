@@ -79,6 +79,38 @@ restarts; already-expired entries are dropped automatically. Ctrl-C prints a
 block-event summary and clears any throttle/lockdown firewall state before
 exiting.
 
+## Docker
+
+Linux only, either mode (this doesn't relax the platform requirement -
+`--inline` is Linux-native NFQUEUE, and passive mode needs a real Linux
+interface, not a Docker Desktop macOS/Windows VM's virtual one):
+
+```bash
+docker build -t dpi-lab .
+
+docker run --rm --network host --cap-add=NET_ADMIN --cap-add=NET_RAW \
+  -v $(pwd)/config:/app/config dpi-lab passive eth0 --lockdown --block-sni evil.com
+
+docker run --rm --network host --cap-add=NET_ADMIN --cap-add=NET_RAW \
+  -v $(pwd)/config:/app/config dpi-lab inline --downgrade-tls13
+```
+
+`--network host` is required either way - passive mode needs to see a real
+host interface, `--inline` needs to actually sit in the host's forwarding
+path (same "this machine must be the actual gateway" requirement native
+`--inline` already has). `--cap-add=NET_ADMIN --cap-add=NET_RAW` covers raw
+sockets + NFQUEUE + nftables; fall back to `--privileged` if something's
+still denied under a locked-down Docker daemon config. Mount `config/` as
+shown so blocklists/rules can be edited without rebuilding the image, same
+as running natively.
+
+**`--lockdown` and throttling don't work in this image** - they shell out
+to macOS's `pfctl`/`dnctl`, which don't exist on Linux at all (not a Docker
+limitation, a platform one). Both fail soft: a log line and the process
+keeps running, every other mechanism (RST inject, DNS spoof, detection,
+SNI/JA3/ASN/allowlist blocking, etc.) is unaffected. See `docker-compose.yml`
+for ready-to-edit service templates.
+
 ## Reproducing the results in writeup.md
 
 ```bash

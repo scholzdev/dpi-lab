@@ -1,0 +1,30 @@
+# Templates, not a ready-to-run stack - interface name and flags are
+# host-specific, edit before use. Only one of these two services makes
+# sense to run at a time (both want the host's network path). `restart: "no"`
+# deliberately: this is an interactive lab tool, not a service that should
+# silently respawn mid-experiment.
+#
+# --lockdown/throttle (pf-based) are macOS-only and will fail soft (log +
+# continue) on this Linux image - see README.md's Docker section.
+services:
+  dpi-lab-passive:
+    build: .
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./config:/app/config
+    command: ["passive", "eth0", "--trace"] # replace eth0 with your real interface
+    restart: "no"
+
+  dpi-lab-inline:
+    build: .
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./config:/app/config
+    command: ["inline"]
+    restart: "no"
