@@ -18,7 +18,7 @@ services:
     volumes:
       - ./config:/app/config
       - ./data:/app/data
-    command: ["passive", "eth0", "--trace", "--events-log", "/app/data/events.jsonl"] # replace eth0 with your real interface
+    command: ["passive", "eth0", "--trace", "--inject", "--events-log", "/app/data/events.jsonl"] # replace eth0 with your real interface; --inject needed or matches never actually block (and never emit an event)
     restart: "no"
 
   dpi-lab-inline:
