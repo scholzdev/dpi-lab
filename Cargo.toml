@@ -11,3 +11,8 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 ctrlc = "3"
 libc = "0.2"
+
+# --inline (genuine NFQUEUE-based inline enforcement, see src/inline.rs) is
+# Linux-only - this dependency doesn't even get fetched/compiled on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+nfq = "0.2"

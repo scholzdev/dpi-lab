@@ -41,7 +41,7 @@ fn looks_like_http_request(payload: &[u8]) -> bool {
 }
 
 /// True if `rule` matches `ip` - exact address, or (IPv4) a CIDR range.
-fn ip_rule_matches(rule: &str, ip: &IpAddr) -> bool {
+pub(crate) fn ip_rule_matches(rule: &str, ip: &IpAddr) -> bool {
     match rule.split_once('/') {
         Some((base, bits)) => {
             let (IpAddr::V4(ip4), Ok(base4), Ok(bits)) = (ip, base.parse::<Ipv4Addr>(), bits.parse::<u32>()) else {

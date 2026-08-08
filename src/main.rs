@@ -20,6 +20,10 @@
 // handshakes (structural signatures, not keyword matches) load from
 // config/handshakes.yml and feed the same [detect]/lockdown pipeline as
 // everything else - UDP only for now, no RST equivalent for that transport.
+// --inline (Linux only) is a different mode entirely: genuine in-path NFQUEUE
+// enforcement instead of passive capture + off-path racing, see src/inline.rs.
+// Run as: sudo ./target/debug/dpi-lab --inline (no interface arg - nftables
+// picks up FORWARD traffic directly, this machine must be the actual gateway).
 // (no arg = list interfaces)
 mod cannon;
 mod classify;
@@ -27,6 +31,7 @@ mod config;
 mod detect;
 mod engine;
 mod inject;
+mod inline;
 mod lockdown;
 mod probe;
 mod reassembly;
@@ -64,6 +69,51 @@ fn print_summary_and_exit(stats: &BlockStats) {
     std::process::exit(0);
 }
 
+/// --inline entry point: loads the same block-list config as everything
+/// else, then hands off to the Linux-only NFQUEUE loop instead of passive
+/// datalink capture. No interface arg - it acts on whatever nftables' FORWARD
+/// hook sees, which means this machine needs to actually be the gateway (see
+/// writeup.md's inline-vs-off-path discussion).
+#[cfg(target_os = "linux")]
+fn run_inline(args: &[String]) {
+    let config_dir = Path::new("config");
+    let mut blocked_sni = config::load_list(&config_dir.join("sni.yml"));
+    blocked_sni.extend(flag_values(args, "--block-sni"));
+    let mut blocked_ja3 = config::load_list(&config_dir.join("ja3.yml"));
+    blocked_ja3.extend(flag_values(args, "--block-ja3"));
+    let mut blocked_ip = config::load_list(&config_dir.join("ip.yml"));
+    blocked_ip.extend(flag_values(args, "--block-ip"));
+    let mut signatures = config::load_list(&config_dir.join("signatures.yml"));
+    signatures.extend(flag_values(args, "--block-sig"));
+    let handshake_rules = config::load_handshake_rules(&config_dir.join("handshakes.yml"));
+
+    let classifier = inline::InlineClassifier {
+        sigs: classify::Signatures::new(&signatures),
+        blocked_sni,
+        blocked_ja3,
+        blocked_ip,
+        handshake_rules,
+    };
+
+    ctrlc::set_handler(|| {
+        inline::clear_nft();
+        std::process::exit(0);
+    })
+    .expect("failed to set Ctrl-C handler");
+
+    if let Err(e) = inline::run(&classifier) {
+        eprintln!("[inline] fatal: {e} (needs root + nft on PATH)");
+        inline::clear_nft();
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_inline(_args: &[String]) {
+    eprintln!("--inline needs Linux (NFQUEUE) - not available on this platform. Use passive capture mode instead.");
+    std::process::exit(1);
+}
+
 /// Collect every value following a repeatable `--flag value` pair, e.g.
 /// `--block-sni a.com --block-sni b.com` -> `["a.com", "b.com"]`.
 fn flag_values(args: &[String], flag: &str) -> Vec<String> {
@@ -76,10 +126,15 @@ fn flag_values(args: &[String], flag: &str) -> Vec<String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--inline") {
+        return run_inline(&args);
+    }
+
     let iface_name = match args.get(1) {
         Some(n) => n.clone(),
         None => {
-            println!("usage: dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns]\navailable interfaces:");
+            println!("usage: dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns]\n   or: dpi-lab --inline (Linux only, genuine in-path NFQUEUE mode - see writeup.md)\navailable interfaces:");
             for i in datalink::interfaces() {
                 println!("  {}", i.name);
             }

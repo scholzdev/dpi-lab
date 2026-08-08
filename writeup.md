@@ -8,8 +8,10 @@ systems: passive payload/metadata classification (keyword, TLS SNI, JA3 client
 fingerprinting), active connection reset (RST) injection, DNS response
 spoofing, entropy-based detection of protocols designed to evade signature
 matching, active probing to confirm a suspected protocol before acting on it,
-Great-Cannon-style HTTP response injection between two owned hosts, and
-adaptive IP-reputation blocking with automatic expiry. The goal
+Great-Cannon-style HTTP response injection between two owned hosts, adaptive
+IP-reputation blocking with automatic expiry, and (Linux only) genuine
+in-path enforcement via NFQUEUE - the one mechanism here that can guarantee
+a block rather than race for one. The goal
 is not to replicate GFW's scale or deployment model, but to build and
 empirically verify each mechanism in isolation, against traffic I fully
 control, as a concrete demonstration of understanding for network security
@@ -431,6 +433,55 @@ levels rather than presented uniformly:
   not a trusted signature - a single-byte anchor is also inherently more
   false-positive-prone than WireGuard's byte-anchors-plus-exact-length.
 
+### 3.12 Genuine in-path enforcement via Linux NFQUEUE
+
+Every mechanism above is off-path or local-only (§1, §3.10): RST injection
+and DNS/response spoofing forge an extra packet and race it against the
+real one because dpi-lab only ever sees a *copy* of traffic via passive
+capture, never the real packet in transit; throttling and lockdown modify
+the local kernel's own firewall, which only does anything for traffic that
+machine's own network stack actually handles. Neither approach can offer a
+*guarantee* - racing can lose, and local enforcement has nothing to act on
+for traffic that never touches that machine at all.
+
+Linux's NFQUEUE (`libnetfilter_queue`) removes both limitations at once: an
+`nftables` rule diverts matching packets into userspace *before* the kernel
+decides to forward them, and the receiving process must return an explicit
+verdict - accept or drop - before the packet continues. The real packet is
+held, not copied. `src/inline.rs` implements this via the `nfq` crate: an
+nft table hooks the `forward` chain (this machine must actually be the
+network's gateway, same requirement discussed for the router-on-a-stick
+Pi/FritzBox setup - NFQUEUE doesn't grant visibility into traffic that
+wouldn't already be routing through this box), queues everything to
+userspace, and `InlineClassifier::classify` - reusing the same pure
+matching functions as the passive path (`ip_rule_matches`,
+`classify::parse_client_hello`/`ja3`/`matches_handshake`,
+`classify::Signatures`) - returns a verdict per packet directly.
+
+**Architecture reference, not copied code.** This design - nftables `queue`
+rule into NFQUEUE, explicit accept/drop verdict per packet - is the same
+approach OpenGFW (github.com/apernet/OpenGFW, MPL-2.0, a real production-
+oriented open-source GFW implementation) uses in its `io/nfqueue.go`. That
+file was read for architecture (queue setup, verdict model, the
+protected-outbound-connection problem) before writing `src/inline.rs`
+independently in Rust against the `nfq` crate rather than OpenGFW's
+Go/`go-nfqueue` stack; no OpenGFW code was copied into this project. Citing
+it here the same way Clayton et al. and Citizen Lab are cited elsewhere in
+this write-up - read the real technique, build an independent
+implementation, attribute the source.
+
+**Deliberate scope reduction vs. the passive path.** `inline.rs` classifies
+one packet at a time - no cross-packet TCP reassembly the way `engine.rs`'s
+`TcpStream` does. A TLS ClientHello split across multiple segments (GREASE,
+ECH padding, large extension lists - the exact case `engine.rs`'s reassembly
+retry logic exists to handle, §3.1) won't be seen whole in inline mode.
+OpenGFW's own approach doesn't hit this the same way because it also marks
+already-decided flows via conntrack to skip re-inspection rather than doing
+one-shot-per-packet classification; `inline.rs` re-inspects every packet of
+every flow (correct, but wasteful past lab scale) rather than implementing
+that bypass optimization - both are documented follow-ups, not oversights,
+consistent with how every other simplification in this project is marked.
+
 ## 4. Evaluation
 
 ### 4.1 A real false-positive, found and fixed during testing
@@ -559,6 +610,19 @@ All of the following were run live, not simulated:
   protocol source, and only WireGuard's has been. IKEv2 and OpenVPN's rules
   are unverified and should be treated as drafts, not trusted signatures,
   until checked against real traffic.
+- **`--inline` (NFQUEUE) is unverified on real hardware.** Confirmed to
+  compile cleanly and pass its pure-logic classifier tests when cross-checked
+  against an `x86_64-unknown-linux-gnu` target (`cargo check`/`cargo test`
+  type-check clean), but not yet actually run against live traffic on Linux -
+  no Docker/Linux environment was available in the session that wrote it. The
+  `InlineClassifier::classify` unit tests need no root/kernel access and
+  should just work on real Linux; the nft-table setup and the NFQUEUE receive
+  loop itself (`inline::run`) need root and an actual `nft`/NFQUEUE-capable
+  kernel and have not been exercised at all yet. This is the least-verified
+  mechanism in the project by a clear margin - treat it as a working draft
+  until run on real hardware (the OpenWrt router this was built for is the
+  natural next test), not as confirmed the way RST injection, cannon, and
+  lockdown are in §4.2.
 
 ## 5. Related work
 
@@ -575,6 +639,10 @@ All of the following were run live, not simulated:
 - Marczak, B. et al. (Citizen Lab, 2015). *China's Great Cannon.* - original
   documentation of the response-injection mechanism §3.9 replicates on a
   strictly reduced, own-lab-only scope.
+- OpenGFW (github.com/apernet/OpenGFW, MPL-2.0) - real, production-oriented
+  open-source GFW implementation; its `io/nfqueue.go` was read for
+  architecture (nftables `queue` + NFQUEUE verdict model) before writing
+  `src/inline.rs` independently in Rust, per §3.12.
 
 ## 6. Ethics statement
 
@@ -589,7 +657,15 @@ infrastructure. Response injection's payload is always inert (a marker string
 and/or a redirect to another host I own) - the real Great Cannon's actual
 weapon, injecting content that attacks a party outside the connection
 entirely, has no implementation here at all, not merely a disabled one; there
-is no parameter that could make it target anything but an owned host. This
+is no parameter that could make it target anything but an owned host.
+`--inline`'s NFQUEUE mode carries a different risk profile from everything
+else here: it only does anything once the host running it is the actual
+network gateway, at which point its effect applies to every device whose
+traffic transits that gateway, not only the host itself. It was designed and
+(to the extent tested so far) only ever run against a single-person home
+network - on a shared network, honoring "own lab only" would require scoping
+enforcement to specific devices rather than the whole gateway, a distinction
+raised and worked through explicitly before any inline testing began. This
 project studies and reproduces documented censorship mechanisms for
 security-research purposes; it is not, and is not intended to become, a
 deployable interception or censorship tool.
