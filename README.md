@@ -90,6 +90,32 @@ The block-event summary, `--scan` results, and the interface list stay on
 plain stdout regardless of `RUST_LOG` - those are direct output, not log
 events.
 
+## Web UI
+
+`dpi-lab-ui` is a separate, unprivileged binary (no root, no raw sockets) -
+a browser-based config editor + live block/lockdown dashboard:
+
+```bash
+cargo build --release
+./target/release/dpi-lab-ui                       # binds 127.0.0.1:8080 by default
+sudo ./target/release/dpi-lab eth0 --inject --events-log events.jsonl
+```
+
+then open `http://127.0.0.1:8080`. The editor lists every `config/*.yml`
+file and edits it as JSON (mirrors the YAML shape 1:1 - a flat list stays a
+JSON array, `asn.yml`'s `{cidr,asn,name}` entries stay objects, etc.) -
+**changes take effect on dpi-lab's next restart**, there's no hot-reload.
+The events table polls `/api/events` every 2s, tailing whatever
+`--events-log` file dpi-lab is appending to (empty/no data until dpi-lab is
+actually running with that flag and has blocked something).
+
+No authentication - matches this whole project's single-user/self-hosted
+framing, same as dpi-lab itself. Binds to `127.0.0.1` only by default, so
+it's not reachable over the network unless you explicitly rebind
+(`--bind 0.0.0.0:8080`) or reverse-proxy it - doing either without adding
+auth in front means anyone who can reach that port can rewrite your
+blocklists.
+
 ## Docker
 
 Linux only, either mode (this doesn't relax the platform requirement -
@@ -114,6 +140,19 @@ sockets + NFQUEUE + nftables; fall back to `--privileged` if something's
 still denied under a locked-down Docker daemon config. Mount `config/` as
 shown so blocklists/rules can be edited without rebuilding the image, same
 as running natively.
+
+The same image also runs `dpi-lab-ui` (see `## Web UI` above) via a third
+mode - no `--network host`/cap_add needed, it's unprivileged:
+
+```bash
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -v $(pwd)/config:/app/config -v $(pwd)/data:/app/data \
+  dpi-lab ui --bind 0.0.0.0:8080 --config-dir /app/config --events-log /app/data/events.jsonl
+```
+
+`docker-compose.yml` has ready-to-edit templates for all three modes,
+wired to share `config/` and `data/events.jsonl` between the capture
+container and the UI container.
 
 **`--lockdown` and throttling don't work in this image** - they shell out
 to macOS's `pfctl`/`dnctl`, which don't exist on Linux at all (not a Docker

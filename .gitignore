@@ -2,3 +2,7 @@
 
 # scratch/assessment doc - explicitly not meant to be committed
 example.md
+
+# runtime-generated: --events-log output, docker-compose's shared data volume
+events.jsonl
+/data

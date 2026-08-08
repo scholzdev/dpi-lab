@@ -1,8 +1,10 @@
 # Templates, not a ready-to-run stack - interface name and flags are
-# host-specific, edit before use. Only one of these two services makes
-# sense to run at a time (both want the host's network path). `restart: "no"`
-# deliberately: this is an interactive lab tool, not a service that should
-# silently respawn mid-experiment.
+# host-specific, edit before use. Only one of dpi-lab-passive/dpi-lab-inline
+# makes sense to run at a time (both want the host's network path);
+# dpi-lab-ui is meant to run alongside whichever one you picked, sharing
+# the same config/ and data/events.jsonl files. `restart: "no"` deliberately:
+# this is an interactive lab tool, not a service that should silently
+# respawn mid-experiment.
 #
 # --lockdown/throttle (pf-based) are macOS-only and will fail soft (log +
 # continue) on this Linux image - see README.md's Docker section.
@@ -15,7 +17,8 @@ services:
       - NET_RAW
     volumes:
       - ./config:/app/config
-    command: ["passive", "eth0", "--trace"] # replace eth0 with your real interface
+      - ./data:/app/data
+    command: ["passive", "eth0", "--trace", "--events-log", "/app/data/events.jsonl"] # replace eth0 with your real interface
     restart: "no"
 
   dpi-lab-inline:
@@ -26,5 +29,18 @@ services:
       - NET_RAW
     volumes:
       - ./config:/app/config
-    command: ["inline"]
+      - ./data:/app/data
+    command: ["inline", "--events-log", "/app/data/events.jsonl"]
+    restart: "no"
+
+  dpi-lab-ui:
+    build: .
+    # No cap_add, no network_mode: host - unprivileged by design (see
+    # events.rs's doc comment). Only needs the shared config/ + events file.
+    ports:
+      - "127.0.0.1:8080:8080" # loopback-only on the host; not network-exposed unless you reverse-proxy it
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+    command: ["ui", "--bind", "0.0.0.0:8080", "--config-dir", "/app/config", "--events-log", "/app/data/events.jsonl"]
     restart: "no"

@@ -7,6 +7,7 @@ FROM rust:1-slim-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY ui ./ui
 RUN cargo build --release
 
 # nftables is only needed for --inline (inline.rs shells out to `nft`,
@@ -18,6 +19,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends nftables && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /build/target/release/dpi-lab /app/dpi-lab
+COPY --from=build /build/target/release/dpi-lab-ui /app/dpi-lab-ui
 COPY config ./config
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh

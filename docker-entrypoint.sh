@@ -15,10 +15,14 @@ case "$mode" in
   passive)
     exec /app/dpi-lab "$@"
     ;;
+  ui)
+    exec /app/dpi-lab-ui "$@"
+    ;;
   *)
-    echo "usage: docker run ... <image> <inline|passive> [dpi-lab args...]" >&2
+    echo "usage: docker run ... <image> <inline|passive|ui> [args...]" >&2
     echo "  inline:  runs --inline (Linux NFQUEUE mode, no interface arg)" >&2
     echo "  passive: runs passive capture, \$1 after 'passive' is the interface" >&2
+    echo "  ui:      runs dpi-lab-ui (unprivileged web UI), e.g. --bind 0.0.0.0:8080" >&2
     exit 1
     ;;
 esac
