@@ -57,6 +57,7 @@ mod cannon;
 mod classify;
 mod config;
 mod detect;
+mod fragment;
 mod engine;
 mod h2;
 mod inject;

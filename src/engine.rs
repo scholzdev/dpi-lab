@@ -12,7 +12,7 @@ use crate::probe;
 use crate::redirect;
 use crate::timing::TimingStats;
 use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ipv4::{Ipv4Flags, Ipv4Packet};
 use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::tcp::{TcpFlags, TcpPacket};
 use pnet::packet::udp::UdpPacket;
@@ -133,6 +133,8 @@ pub struct Engine {
     streams: HashMap<FlowKey, FlowState>,
     udp_timing: HashMap<FlowKey, (TimingStats, Instant)>, // stats + last-seen, for idle eviction
     udp_allowlist_logged: std::collections::HashSet<FlowKey>, // one-shot gate, see allowlist_only check in handle_udp
+    ip4_fragments: crate::fragment::FragmentTable<(Ipv4Addr, Ipv4Addr, u8, u16)>, // (src, dst, proto, IP id) - see fragment.rs
+    ip6_fragments: crate::fragment::FragmentTable<(std::net::Ipv6Addr, std::net::Ipv6Addr, u32)>, // (src, dst, frag-header id)
     sigs: Signatures,
     handshake_rules: Vec<classify::HandshakeRule>, // known protocol handshake signatures, see config/handshakes.yml
     injector: Option<TransportSender>,
@@ -279,6 +281,8 @@ impl Engine {
             streams: HashMap::new(),
             udp_timing: HashMap::new(),
             udp_allowlist_logged: std::collections::HashSet::new(),
+            ip4_fragments: crate::fragment::FragmentTable::new(),
+            ip6_fragments: crate::fragment::FragmentTable::new(),
             sigs: Signatures::new(&signatures),
             handshake_rules,
             injector,
@@ -312,22 +316,41 @@ impl Engine {
     /// capture/reassembly/classification but no RST injection (needs a
     /// separate raw socket + IPv6 pseudo-header checksum, not done).
     pub fn handle_frame_v4(&mut self, ip: &Ipv4Packet) {
-        let (src, dst) = (IpAddr::V4(ip.get_source()), IpAddr::V4(ip.get_destination()));
-        self.dispatch(src, dst, ip.get_next_level_protocol(), ip.payload());
+        let (src, dst) = (ip.get_source(), ip.get_destination());
+        let proto = ip.get_next_level_protocol();
+        // Fast path: the overwhelming common case (an unfragmented datagram)
+        // costs nothing extra - only a fragment_offset != 0 or MF-set packet
+        // ever touches the reassembly table.
+        if ip.get_fragment_offset() == 0 && ip.get_flags() & Ipv4Flags::MoreFragments == 0 {
+            self.dispatch(IpAddr::V4(src), IpAddr::V4(dst), proto, ip.payload());
+            return;
+        }
+        let key = (src, dst, proto.0, ip.get_identification());
+        let offset = ip.get_fragment_offset() as usize * 8; // wire units are 8-byte blocks
+        let more = ip.get_flags() & Ipv4Flags::MoreFragments != 0;
+        if let Some(reassembled) = self.ip4_fragments.insert(key, offset, more, ip.payload()) {
+            println!("  [detect] ip-fragment-reassembled {src} -> {dst} (proto={}, {} bytes)", proto.0, reassembled.len());
+            self.dispatch(IpAddr::V4(src), IpAddr::V4(dst), proto, &reassembled);
+        }
     }
 
     pub fn handle_frame_v6(&mut self, ip: &Ipv6Packet) {
-        let (src, dst) = (IpAddr::V6(ip.get_source()), IpAddr::V6(ip.get_destination()));
+        let (src, dst) = (ip.get_source(), ip.get_destination());
         // A packet carrying Hop-by-Hop/Routing/Destination-Options/Fragment
         // extension headers has the real upper-layer protocol and payload
         // further in than `get_next_header()`/`payload()` alone would say -
-        // see ipv6ext.rs. Fragment reassembly (when `frag` comes back Some)
-        // is wired in Phase B; for now this just makes non-fragmented
-        // extension-header traffic classify correctly instead of silently
-        // misparsing it as whatever the first extension header's bytes look
-        // like to a TCP/UDP parser.
-        let (proto, payload, _frag) = crate::ipv6ext::walk_ipv6_extensions(ip.get_next_header(), ip.payload());
-        self.dispatch(src, dst, proto, payload);
+        // see ipv6ext.rs.
+        let (proto, payload, frag) = crate::ipv6ext::walk_ipv6_extensions(ip.get_next_header(), ip.payload());
+        let Some(frag) = frag else {
+            self.dispatch(IpAddr::V6(src), IpAddr::V6(dst), proto, payload);
+            return;
+        };
+        let key = (src, dst, frag.id);
+        let offset = frag.offset as usize * 8;
+        if let Some(reassembled) = self.ip6_fragments.insert(key, offset, frag.more_fragments, payload) {
+            println!("  [detect] ip-fragment-reassembled {src} -> {dst} (proto={}, {} bytes)", proto.0, reassembled.len());
+            self.dispatch(IpAddr::V6(src), IpAddr::V6(dst), proto, &reassembled);
+        }
     }
 
     fn dispatch(&mut self, src: IpAddr, dst: IpAddr, proto: pnet::packet::ip::IpNextHeaderProtocol, payload: &[u8]) {
@@ -388,6 +411,8 @@ impl Engine {
         self.udp_timing.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < IDLE_TIMEOUT);
         let live: &HashMap<_, _> = &self.udp_timing;
         self.udp_allowlist_logged.retain(|k| live.contains_key(k));
+        self.ip4_fragments.prune(IDLE_TIMEOUT);
+        self.ip6_fragments.prune(IDLE_TIMEOUT);
     }
 
     fn handle_tcp(&mut self, src: IpAddr, dst: IpAddr, tcp: &TcpPacket) {
