@@ -98,6 +98,7 @@ struct FlowState {
     timing: TimingStats,
     ip_checked: bool,
     cannon_fired: bool,
+    handshake_checked: bool, // TCP-side structural handshake match (e.g. SSH banner), once per flow
 }
 
 pub struct Engine {
@@ -321,6 +322,7 @@ impl Engine {
                 timing: TimingStats::new(),
                 ip_checked: false,
                 cannon_fired: false,
+                handshake_checked: false,
             }
         });
 
@@ -371,6 +373,31 @@ impl Engine {
             }
         }
         state.sig_scanned_len = state.stream.delivered.len();
+
+        // TCP-side structural handshakes (e.g. SSH's plaintext "SSH-..." version
+        // banner, RFC 4253 §4.2) - same rule database as the UDP side, just
+        // scoped to protocol: tcp/omitted rules via rule_applies_to. Checked
+        // once per flow against the reassembled buffer, not the raw packet,
+        // since a banner line could in principle be split across segments.
+        if !state.handshake_checked && !state.stream.delivered.is_empty() {
+            if let Some(rule) = self
+                .handshake_rules
+                .iter()
+                .filter(|r| classify::rule_applies_to(r, "tcp"))
+                .find(|r| classify::matches_handshake(&state.stream.delivered, r))
+            {
+                println!("  [detect] {} on {src}:{sport} -> {dst}:{dport}", rule.name);
+                state.handshake_checked = true;
+                if self.lockdown_enabled {
+                    lockdown_on_match(&mut self.lockdown_ips, src, &rule.name);
+                }
+                if self.inject_on_detect {
+                    block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "handshake", &rule.name);
+                }
+            } else if state.stream.delivered.len() >= 32 {
+                state.handshake_checked = true; // give up - not this protocol
+            }
+        }
 
         // ClientHellos can span multiple segments; retry against the growing
         // reassembled buffer until parsed or CLIENTHELLO_CAP is hit.
@@ -482,7 +509,12 @@ impl Engine {
             if let Some(name) = parse_dns_query_full(payload).map(|q| q.name) {
                 println!("  [dns] {src}:{sport} -> {dst}:{dport}  query={name}");
             }
-        } else if let Some(rule) = self.handshake_rules.iter().find(|r| classify::matches_handshake(payload, r)) {
+        } else if let Some(rule) = self
+            .handshake_rules
+            .iter()
+            .filter(|r| classify::rule_applies_to(r, "udp"))
+            .find(|r| classify::matches_handshake(payload, r))
+        {
             // Structural recognition (byte anchors + exact length from
             // config/handshakes.yml), not a keyword search - fires on any
             // connection attempting that handshake regardless of destination

@@ -53,7 +53,7 @@ impl InlineClassifier {
     /// Decide a verdict for one packet. Returns Some(reason) to block,
     /// None to accept. Pure function over bytes - no network/kernel access,
     /// so this is the part that's actually unit-testable without root/Linux.
-    pub fn classify(&self, src: IpAddr, dst: IpAddr, sport: u16, dport: u16, payload: &[u8]) -> Option<String> {
+    pub fn classify(&self, src: IpAddr, dst: IpAddr, sport: u16, dport: u16, transport: &str, payload: &[u8]) -> Option<String> {
         if self.blocked_ip.iter().any(|r| ip_rule_matches(r, &src) || ip_rule_matches(r, &dst)) {
             return Some("ip".to_string());
         }
@@ -72,7 +72,12 @@ impl InlineClassifier {
                 }
             }
         }
-        if let Some(rule) = self.handshake_rules.iter().find(|r| classify::matches_handshake(payload, r)) {
+        if let Some(rule) = self
+            .handshake_rules
+            .iter()
+            .filter(|r| classify::rule_applies_to(r, transport))
+            .find(|r| classify::matches_handshake(payload, r))
+        {
             return Some(format!("handshake: {}", rule.name));
         }
         let _ = (sport, dport); // reserved for future port-scoped rules
@@ -163,11 +168,11 @@ fn decide_transport(
     match proto {
         IpNextHeaderProtocols::Tcp => {
             let tcp = TcpPacket::new(payload)?;
-            classifier.classify(src, dst, tcp.get_source(), tcp.get_destination(), tcp.payload())
+            classifier.classify(src, dst, tcp.get_source(), tcp.get_destination(), "tcp", tcp.payload())
         }
         IpNextHeaderProtocols::Udp => {
             let udp = UdpPacket::new(payload)?;
-            classifier.classify(src, dst, udp.get_source(), udp.get_destination(), udp.payload())
+            classifier.classify(src, dst, udp.get_source(), udp.get_destination(), "udp", udp.payload())
         }
         _ => None,
     }
@@ -187,6 +192,7 @@ mod tests {
                 name: "wireguard-handshake-init".to_string(),
                 length: Some(148),
                 anchors: vec![classify::HandshakeAnchor { offset: 0, bytes: vec![1, 0, 0, 0] }],
+                protocol: Some("udp".to_string()),
             }],
         }
     }
@@ -196,7 +202,7 @@ mod tests {
         let c = classifier();
         let src: IpAddr = "10.27.0.99".parse().unwrap();
         let dst: IpAddr = "1.1.1.1".parse().unwrap();
-        assert_eq!(c.classify(src, dst, 1234, 443, b""), Some("ip".to_string()));
+        assert_eq!(c.classify(src, dst, 1234, 443, "tcp", b""), Some("ip".to_string()));
     }
 
     #[test]
@@ -204,7 +210,7 @@ mod tests {
         let c = classifier();
         let src: IpAddr = "10.27.1.50".parse().unwrap();
         let dst: IpAddr = "1.1.1.1".parse().unwrap();
-        assert_eq!(c.classify(src, dst, 1234, 443, b""), Some("ip".to_string()));
+        assert_eq!(c.classify(src, dst, 1234, 443, "tcp", b""), Some("ip".to_string()));
     }
 
     #[test]
@@ -212,7 +218,10 @@ mod tests {
         let c = classifier();
         let src: IpAddr = "10.27.0.5".parse().unwrap();
         let dst: IpAddr = "1.1.1.1".parse().unwrap();
-        assert_eq!(c.classify(src, dst, 1234, 80, b"GET /malware.exe HTTP/1.1"), Some("signature: malware".to_string()));
+        assert_eq!(
+            c.classify(src, dst, 1234, 80, "tcp", b"GET /malware.exe HTTP/1.1"),
+            Some("signature: malware".to_string())
+        );
     }
 
     #[test]
@@ -222,7 +231,17 @@ mod tests {
         let dst: IpAddr = "10.27.0.10".parse().unwrap();
         let mut pkt = vec![0u8; 148];
         pkt[0] = 1;
-        assert_eq!(c.classify(src, dst, 51820, 51820, &pkt), Some("handshake: wireguard-handshake-init".to_string()));
+        assert_eq!(c.classify(src, dst, 51820, 51820, "udp", &pkt), Some("handshake: wireguard-handshake-init".to_string()));
+    }
+
+    #[test]
+    fn wireguard_rule_does_not_match_over_tcp() {
+        let c = classifier();
+        let src: IpAddr = "10.27.0.5".parse().unwrap();
+        let dst: IpAddr = "10.27.0.10".parse().unwrap();
+        let mut pkt = vec![0u8; 148];
+        pkt[0] = 1;
+        assert_eq!(c.classify(src, dst, 51820, 51820, "tcp", &pkt), None); // protocol-scoped, wrong transport
     }
 
     #[test]
@@ -230,6 +249,6 @@ mod tests {
         let c = classifier();
         let src: IpAddr = "10.27.0.5".parse().unwrap();
         let dst: IpAddr = "1.1.1.1".parse().unwrap();
-        assert_eq!(c.classify(src, dst, 1234, 443, b"perfectly normal traffic"), None);
+        assert_eq!(c.classify(src, dst, 1234, 443, "tcp", b"perfectly normal traffic"), None);
     }
 }

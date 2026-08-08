@@ -7,8 +7,12 @@
 #
 # `length` (optional): exact total payload length required.
 # `match`: list of byte anchors, each an offset + the exact bytes expected there.
+# `protocol` (optional): "tcp" or "udp" - omit to match either transport.
 - name: wireguard-handshake-init
-  # Verified live against a real wg-easy tunnel (see writeup.md §4.2).
+  # Verified live against a real wg-easy tunnel (writeup.md §4.2), and
+  # cross-checked byte-for-byte against OpenGFW's analyzer/udp/wireguard.go
+  # (github.com/apernet/OpenGFW, MPL-2.0) - same type/reserved/length checks.
+  protocol: udp
   length: 148 # type(1) + reserved(3) + sender_index(4) + ephemeral(32) + encrypted_static(48) + encrypted_timestamp(28) + mac1(16) + mac2(16)
   match:
     - offset: 0
@@ -20,6 +24,7 @@
   # WireGuard, the SA proposal payloads that follow the header vary in size,
   # so only the fixed header fields are anchored. Non-NAT-T only (NAT-T on
   # UDP/4500 prepends 4 zero bytes before this header, not accounted for).
+  protocol: udp
   match:
     - offset: 8
       bytes: [0, 0, 0, 0, 0, 0, 0, 0] # Responder SPI: zero until the responder replies
@@ -33,12 +38,29 @@
       bytes: [0, 0, 0, 0] # Message ID: 0 for the first exchange
 
 - name: openvpn-hard-reset-client-v2
-  # Best-effort from OpenVPN's documented opcode scheme (opcode<<3 | key_id);
-  # P_CONTROL_HARD_RESET_CLIENT_V2 = 7, key_id = 0 on a fresh session ->
-  # 0x38. NOT packet-captured or otherwise confirmed - treat as a starting
-  # point to verify against real OpenVPN traffic, not a trusted signature yet.
+  # Byte value now cross-checked against OpenGFW's analyzer/udp/openvpn.go
+  # (github.com/apernet/OpenGFW, MPL-2.0): opcode = byte>>3, key_id = byte&0x07;
+  # P_CONTROL_HARD_RESET_CLIENT_V2 = 7 -> (7<<3)|0 = 0x38 for a fresh session's
+  # first packet (key_id 0). Real source confirms the byte value, but this
+  # rule is still narrower than the real protocol: it only matches key_id=0
+  # exactly (an exact byte anchor can't express "top 5 bits == 7, bottom 3
+  # bits == anything"), so a hard-reset with nonzero key_id is missed. Not
+  # yet packet-captured against live OpenVPN traffic either.
   # No `length`: control-channel packet size varies with tls-auth/tls-crypt
   # and ack-array contents.
+  protocol: udp
   match:
     - offset: 0
       bytes: [0x38]
+
+- name: ssh-version-exchange
+  # RFC 4253 §4.2: every SSH connection's very first bytes are the literal
+  # ASCII "SSH-" version-exchange prefix, before any encryption negotiation.
+  # Highest confidence of any rule here - a fixed protocol-specified literal,
+  # not a guessed byte offset, cross-checked against OpenGFW's
+  # analyzer/tcp/ssh.go (same "SSH-" prefix check). No `length`: the banner
+  # line's total length varies with client/server software name and version.
+  protocol: tcp
+  match:
+    - offset: 0
+      bytes: [0x53, 0x48, 0x53, 0x2D] # "SSH-"

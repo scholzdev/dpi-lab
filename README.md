@@ -47,7 +47,7 @@ at infrastructure you own or are explicitly authorized to test.
 
 ```bash
 cargo build
-cargo test                              # 55 unit tests, no network/root needed
+cargo test                              # 57 unit tests, no network/root needed
 sudo ./target/debug/dpi-lab <interface> [flags]     # passive capture, off-path enforcement
 sudo ./target/debug/dpi-lab --inline                # Linux only: genuine in-path NFQUEUE mode
 ```
@@ -67,7 +67,7 @@ to actually capture). Key flags:
 | `--block-sni/-ja3/-ip/-sig <value>` | repeatable, adds one rule on top of the matching `config/*.yml` |
 
 Block lists (`config/{sni,ja3,ip,signatures}.yml`), known protocol handshake
-signatures (`config/handshakes.yml` - byte anchors + length, not keywords),
+signatures (`config/handshakes.yml` - byte anchors + length, protocol-scoped, not keywords - WireGuard, IKEv2, OpenVPN, SSH seeded),
 the DNS redirect map (`config/redirect.yml`), throttle rates
 (`config/throttle.yml`), the active-probing allow-list
 (`config/probe_targets.yml`), and the response-injection allow-list + payload

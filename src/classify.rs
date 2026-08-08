@@ -201,12 +201,24 @@ pub struct HandshakeRule {
     pub length: Option<usize>,
     #[serde(rename = "match", default)]
     pub anchors: Vec<HandshakeAnchor>,
+    /// "tcp" | "udp" | omitted (matches either). Without this, a UDP-only
+    /// rule like WireGuard's could in principle match bytes that happen to
+    /// land at the same offsets in an unrelated TCP stream - astronomically
+    /// unlikely by chance given the byte anchors involved, but scoping by
+    /// transport is free correctness, not paranoia.
+    pub protocol: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct HandshakeAnchor {
     pub offset: usize,
     pub bytes: Vec<u8>,
+}
+
+/// True if `rule` applies to `transport` ("tcp"/"udp") - rules with no
+/// `protocol` set apply to either.
+pub fn rule_applies_to(rule: &HandshakeRule, transport: &str) -> bool {
+    rule.protocol.as_deref().is_none_or(|p| p == transport)
 }
 
 /// True if `payload` matches every anchor (and the exact length, if set) in `rule`.
@@ -241,6 +253,7 @@ mod tests {
             name: "wireguard-handshake-init".to_string(),
             length: Some(148),
             anchors: vec![HandshakeAnchor { offset: 0, bytes: vec![1, 0, 0, 0] }],
+            protocol: Some("udp".to_string()),
         }
     }
 
@@ -274,9 +287,31 @@ mod tests {
 
     #[test]
     fn rule_with_no_anchors_matches_on_length_alone() {
-        let rule = HandshakeRule { name: "any-148-byte-udp".to_string(), length: Some(148), anchors: vec![] };
+        let rule = HandshakeRule { name: "any-148-byte-udp".to_string(), length: Some(148), anchors: vec![], protocol: None };
         assert!(matches_handshake(&[0u8; 148], &rule));
         assert!(!matches_handshake(&[0u8; 100], &rule));
+    }
+
+    #[test]
+    fn ssh_banner_recognized_by_prefix() {
+        let rule = HandshakeRule {
+            name: "ssh-version-exchange".to_string(),
+            length: None,
+            anchors: vec![HandshakeAnchor { offset: 0, bytes: b"SSH-".to_vec() }],
+            protocol: Some("tcp".to_string()),
+        };
+        assert!(matches_handshake(b"SSH-2.0-OpenSSH_9.6\r\n", &rule));
+        assert!(!matches_handshake(b"GET / HTTP/1.1\r\n", &rule));
+    }
+
+    #[test]
+    fn rule_applies_to_scopes_by_transport() {
+        let udp_only = HandshakeRule { name: "x".to_string(), length: None, anchors: vec![], protocol: Some("udp".to_string()) };
+        let either = HandshakeRule { name: "y".to_string(), length: None, anchors: vec![], protocol: None };
+        assert!(rule_applies_to(&udp_only, "udp"));
+        assert!(!rule_applies_to(&udp_only, "tcp"));
+        assert!(rule_applies_to(&either, "udp"));
+        assert!(rule_applies_to(&either, "tcp"));
     }
 
     #[test]

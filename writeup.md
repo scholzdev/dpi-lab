@@ -406,32 +406,46 @@ structural rather than IP-based, it also fires on *any* WireGuard handshake
 attempt regardless of which server it's aimed at - unlike `config/ip.yml`,
 which requires already knowing the target IP in advance.
 
-Wired into the same pipeline as everything else: a match prints `[detect]
-<rule-name> on ...` and, with `--lockdown`, pf-blocks the source IP. UDP has
-no TCP-RST equivalent, so `--inject` doesn't apply to handshake matches;
-`--lockdown`'s IP-level block is protocol-agnostic and works regardless.
+Wired into both the UDP and TCP paths of the same pipeline as everything
+else: a match prints `[detect] <rule-name> on ...` and, with `--lockdown`,
+pf-blocks the source IP; on the TCP side, a match also respects
+`--inject-on-detect` the same way an entropy detect does. Rules carry an
+optional `protocol: tcp|udp` field (`classify::rule_applies_to`) so a
+UDP-only rule's byte anchors can't spuriously match an unrelated TCP stream
+that happens to land on the same offsets, and vice versa - cheap correctness
+once both transports feed the same rule database, not paranoia.
 
 **Rule database, and an explicit confidence tier per entry.** No public
 "database" of these signatures in this project's rule format exists (nDPI and
 Wireshark's dissectors are the closest real references, but neither is a
 drop-in - both encode detection as code, sometimes stateful, not a flat
-offset+bytes list); `config/handshakes.yml`'s three seeded rules were each
+offset+bytes list); `config/handshakes.yml`'s four seeded rules were each
 hand-derived from a primary source, and are labeled with different confidence
 levels rather than presented uniformly:
 
+- `ssh-version-exchange` - **highest confidence**: RFC 4253 §4.2 specifies
+  the literal ASCII `"SSH-"` prefix as every SSH connection's first bytes -
+  a fixed protocol-mandated literal, not a guessed byte offset.
 - `wireguard-handshake-init` - **live-verified** against a real `wg-easy`
-  tunnel (§4.2).
+  tunnel (§4.2), and separately cross-checked byte-for-byte against OpenGFW's
+  (github.com/apernet/OpenGFW, MPL-2.0) `analyzer/udp/wireguard.go` - same
+  type-byte, reserved-bytes, and 148-byte-length checks, independently
+  arrived at before that cross-check confirmed them.
+- `openvpn-hard-reset-client-v2` - originally the lowest-confidence entry
+  ("recalled from general protocol knowledge, not checked against a source"),
+  **since upgraded**: reading OpenGFW's `analyzer/udp/openvpn.go` confirmed
+  the `0x38` byte value exactly (`opcode = byte>>3`, `P_CONTROL_HARD_RESET_
+  CLIENT_V2 = 7`, `key_id = 0` on a fresh session -> `(7<<3)|0 = 0x38`). Still
+  narrower than the real protocol, though: an exact-byte anchor can't express
+  "top 5 bits == 7, any bottom 3 bits," so a hard-reset with nonzero `key_id`
+  is missed - a real limitation of this project's byte-anchor rule schema
+  (vs. OpenGFW's actual bitwise opcode check), not fixed here. Still not
+  packet-captured against live OpenVPN traffic.
 - `ikev2-sa-init` - derived from RFC 7296 §3.1's fixed 28-byte IKE header
   (Responder SPI, Version, Exchange Type, Flags, Message ID all zero/fixed on
   the first packet of an exchange); not live-verified against real IKEv2
-  traffic. Non-NAT-T only.
-- `openvpn-hard-reset-client-v2` - **lowest confidence of the three**: a
-  single-byte anchor (`0x38`, from OpenVPN's documented `opcode<<3 | key_id`
-  scheme for `P_CONTROL_HARD_RESET_CLIENT_V2`) recalled from general protocol
-  knowledge, not checked against a packet capture or the OpenVPN source
-  directly. Flagged in the YAML file itself as a starting point to verify,
-  not a trusted signature - a single-byte anchor is also inherently more
-  false-positive-prone than WireGuard's byte-anchors-plus-exact-length.
+  traffic, and not cross-checked against any reference implementation (IKEv2
+  isn't one of OpenGFW's analyzers). Non-NAT-T only.
 
 ### 3.12 Genuine in-path enforcement via Linux NFQUEUE
 
@@ -602,14 +616,29 @@ All of the following were run live, not simulated:
   locking an IP down blocks *all* its traffic, not just the
   matched flow - a broader blast radius than RST injection's per-connection
   reset, intentional for what "lockdown" means but worth stating precisely.
-- **Handshake rule database has three entries at three different confidence
-  levels**, not three equally-trustworthy signatures - see §3.11's per-rule
+- **Handshake rule database has four entries at different confidence
+  levels**, not four equally-trustworthy signatures - see §3.11's per-rule
   breakdown. The database mechanism generalizes cleanly (a YAML edit adds a
   protocol); what doesn't generalize is verification - each new rule still
-  needs someone to confirm it against a real packet capture or the actual
-  protocol source, and only WireGuard's has been. IKEv2 and OpenVPN's rules
-  are unverified and should be treated as drafts, not trusted signatures,
-  until checked against real traffic.
+  needs someone to confirm it against a real packet capture or a reference
+  implementation. SSH's is a fixed protocol literal (highest confidence by
+  construction); WireGuard's is both live-verified and cross-checked against
+  OpenGFW's real implementation; OpenVPN's byte value is now cross-checked
+  against source but not live-verified, and is narrower than the real
+  protocol (misses nonzero `key_id`); IKEv2's is spec-derived only, checked
+  against neither a capture nor a reference implementation. Treat the last
+  two as drafts, not trusted signatures, until checked against real traffic.
+- **QUIC detection was investigated and deliberately not attempted.**
+  OpenGFW's QUIC analyzer decrypts the Initial packet's crypto payload
+  (RFC 9001 Initial-secret derivation via HKDF, then AES-128-GCM) to reach
+  the TLS ClientHello inside - real cryptographic work (~560 lines across
+  header parsing, key derivation, and AEAD decryption in OpenGFW's
+  `analyzer/udp/internal/quic/`), not a byte-anchor structural check like
+  everything else in `handshakes.yml`. Correctly implementing that wasn't
+  something to rush into this session just to close the gap - QUIC/HTTP-3
+  traffic is currently invisible to this project entirely, a real and
+  growing blind spot, but a properly-scoped follow-up rather than a corner
+  cut here.
 - **`--inline` (NFQUEUE) is unverified on real hardware.** Confirmed to
   compile cleanly and pass its pure-logic classifier tests when cross-checked
   against an `x86_64-unknown-linux-gnu` target (`cargo check`/`cargo test`

@@ -212,7 +212,10 @@ mod tests {
     fn real_handshakes_yml_parses_with_expected_rules() {
         let rules = load_handshake_rules(Path::new("config/handshakes.yml"));
         let names: Vec<&str> = rules.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["wireguard-handshake-init", "ikev2-sa-init", "openvpn-hard-reset-client-v2"]);
+        assert_eq!(
+            names,
+            vec!["wireguard-handshake-init", "ikev2-sa-init", "openvpn-hard-reset-client-v2", "ssh-version-exchange"]
+        );
     }
 
     // unique-per-test filename in the OS temp dir - tests run in parallel
