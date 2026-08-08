@@ -10,6 +10,10 @@
 // ASN database; config/asn.yml ships documented example ranges only.
 // --block-doh: escalate [doh] (known public DoH/DoT resolver IP match, see
 // config/doh_providers.yml) from log-only to an actual block.
+// --inject now also covers IPv6 flows (see inject::Ipv6RstSender) - Linux
+// only (needs IPV6_HDRINCL, absent from macOS's raw IPv6 socket API); on
+// other platforms IPv6 RST silently no-ops, same fallback shape as
+// --redirect-dns's existing IPv6 handling.
 // --trace prints every raw TCP/UDP packet (flood); without it, only
 // classification/block events ([sni] [ja3] [host] [ech] [quic-sni] [quic-ja3]
 // [detect] [dns] [inject] [timing] [ip]) print. --block-ech requires --lockdown
