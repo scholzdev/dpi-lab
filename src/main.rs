@@ -14,6 +14,10 @@
 // --block-fronting: escalate [fronting] (ClientHello SNI doesn't match any
 // name on the server's own TLS <=1.2 certificate - the observable proxy for
 // domain fronting) from log-only to an actual block.
+// config/schedule.yml: time windows that force --allowlist-only/--block-quic
+// on during specific hours/days on top of whatever's already configured -
+// see engine.rs's maybe_apply_schedule. Empty by default, no restart needed
+// to pick up edits (same hot-reload poll as every other list here).
 // --events-log <path>: append one JSON line per real block/lockdown event
 // to <path>, for dpi-lab-ui's live dashboard (see events.rs, src/bin/
 // dpi-lab-ui.rs). Off by default - no file, no writes.

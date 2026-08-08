@@ -1,0 +1,14 @@
+# Time windows that force stricter policy on top of whatever's already
+# configured - a window only ever adds, never relaxes (allowlist_only/
+# block_quic here OR'd with whatever --allowlist-only/--block-quic already
+# set at startup). Empty by default - nothing scheduled. Picked up within
+# CONFIG_RELOAD_INTERVAL (~5s) of editing, no restart needed.
+#
+# - days: [Fri, Sat, Sun]   # optional, omit = every day; case-insensitive, 3-letter or full name
+#   start: "22:00"
+#   end: "06:00"            # end < start wraps past midnight - see engine.rs's
+#                           # maybe_apply_schedule doc comment for the one real
+#                           # caveat that has (a wrapping window's post-midnight
+#                           # portion needs the *next* day listed too).
+#   allowlist_only: true
+#   block_quic: true

@@ -149,7 +149,8 @@ pub struct Engine {
     blocked_ja4: Vec<String>,
     blocked_ip: Vec<(String, Option<Instant>)>, // (ip, expiry) - None = permanent, Some = auto-escalated
     allowlist: Vec<String>, // IP/CIDR allow-list, only meaningful when allowlist_only is set
-    allowlist_only: bool, // default-deny: block everything NOT on `allowlist`, ignoring blocked_ip entirely
+    allowlist_only: bool, // LIVE value - base_allowlist_only OR'd with any currently-active schedule window
+    base_allowlist_only: bool, // the CLI/startup-config value, schedule windows only ever add to this, never override it off
     asn_ranges: Vec<crate::asn::AsnRange>, // ip -> ASN lookup table, see config/asn.yml
     blocked_asn: Vec<u32>,
     probe_targets: Vec<String>, // allow-list for active probing, see probe.rs
@@ -158,7 +159,9 @@ pub struct Engine {
     lockdown_ips: Vec<(String, Instant)>, // deterministic pf-level blocks, see lockdown.rs
     lockdown_enabled: bool,
     block_ech: bool,  // block on encrypted_client_hello presence alone - can't read SNI to filter by name
-    block_quic: bool, // force QUIC->TCP downgrade: blanket-drop UDP:443, see lockdown::build_ruleset
+    block_quic: bool, // LIVE value, same base/schedule-OR shape as allowlist_only above
+    base_block_quic: bool,
+    schedule: Vec<crate::config::ScheduleWindow>, // config/schedule.yml, see maybe_apply_schedule
     doh_providers: Vec<(String, String)>, // ip_or_cidr -> name, see config/doh_providers.yml
     block_doh: bool, // off by default: [doh] just logs unless this is set
     block_fronting: bool, // off by default: [fronting] just logs unless this is set
@@ -305,6 +308,10 @@ impl Engine {
         let now = Instant::now();
         let blocked_ip = blocked_ip.into_iter().map(|(ip, ttl)| (ip, ttl.map(|d| now + d))).collect();
         let lockdown_ips = lockdown_ips.into_iter().map(|(ip, d)| (ip, now + d)).collect();
+        let schedule = crate::config::load_schedule(&config_dir.join("schedule.yml"));
+        if !schedule.is_empty() {
+            log::info!("[schedule] {} time window(s) loaded from schedule.yml", schedule.len());
+        }
         Ok(Self {
             streams: HashMap::new(),
             udp_timing: HashMap::new(),
@@ -325,6 +332,7 @@ impl Engine {
             blocked_ip,
             allowlist,
             allowlist_only,
+            base_allowlist_only: allowlist_only,
             asn_ranges,
             blocked_asn,
             probe_targets,
@@ -334,6 +342,8 @@ impl Engine {
             lockdown_enabled,
             block_ech,
             block_quic,
+            base_block_quic: block_quic,
+            schedule,
             doh_providers,
             block_doh,
             block_fronting,
@@ -484,11 +494,39 @@ impl Engine {
         self.handshake_rules = crate::config::load_handshake_rules(&self.config_dir.join("handshakes.yml"));
         self.doh_providers = crate::config::load_map(&self.config_dir.join("doh_providers.yml"));
         self.cannon = crate::config::load_cannon_config(&self.config_dir.join("cannon.yml"));
+        self.schedule = crate::config::load_schedule(&self.config_dir.join("schedule.yml"));
 
         let signatures = crate::config::load_list(&self.config_dir.join("signatures.yml"));
         self.sigs = Signatures::new(&signatures);
 
         log::debug!("[reload] config refreshed from {}", self.config_dir.display());
+        self.maybe_apply_schedule();
+    }
+
+    /// Recompute the live `allowlist_only`/`block_quic` from the base
+    /// (CLI/startup-config) value OR'd with whether any currently-active
+    /// schedule window sets it - a window only ever adds stricter policy on
+    /// top of what's already configured, never relaxes it. Only logs on an
+    /// actual transition (entering/leaving a window), not every poll tick -
+    /// same "don't spam the log" discipline as everything else here.
+    fn maybe_apply_schedule(&mut self) {
+        let now_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let (weekday, hour, minute) = crate::events::weekday_hour_minute(now_epoch);
+
+        let scheduled_allowlist_only = self.schedule.iter().any(|w| w.allowlist_only && w.is_active(weekday, hour, minute));
+        let scheduled_block_quic = self.schedule.iter().any(|w| w.block_quic && w.is_active(weekday, hour, minute));
+
+        let live_allowlist_only = self.base_allowlist_only || scheduled_allowlist_only;
+        let live_block_quic = self.base_block_quic || scheduled_block_quic;
+
+        if live_allowlist_only != self.allowlist_only {
+            log::info!("[schedule] allowlist-only mode now {}", if live_allowlist_only { "ON" } else { "OFF" });
+            self.allowlist_only = live_allowlist_only;
+        }
+        if live_block_quic != self.block_quic {
+            log::info!("[schedule] block-quic now {}", if live_block_quic { "ON" } else { "OFF" });
+            self.block_quic = live_block_quic;
+        }
     }
 
     fn handle_tcp(&mut self, src: IpAddr, dst: IpAddr, tcp: &TcpPacket) {
@@ -1250,6 +1288,40 @@ mod tests {
         engine.last_config_reload = Instant::now() - CONFIG_RELOAD_INTERVAL - Duration::from_secs(1);
         engine.maybe_reload_config();
         assert_eq!(engine.blocked_sni, vec!["changed.example"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schedule_window_forces_allowlist_only_on_reload() {
+        let dir = std::env::temp_dir().join("dpi-lab-test-schedule");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A window covering right now (this hour, every day) so the test is
+        // deterministic regardless of when the suite actually runs - same
+        // weekday/hour extraction the real feature uses.
+        let now_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let (_, hour, _) = crate::events::weekday_hour_minute(now_epoch);
+        let end_hour = (hour as u16 + 1) % 24;
+        std::fs::write(dir.join("schedule.yml"), format!("- start: \"{hour:02}:00\"\n  end: \"{end_hour:02}:00\"\n  allowlist_only: true\n")).unwrap();
+
+        let mut engine =
+            Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, false, Arc::new(Mutex::new(HashMap::new())), None, dir.clone())
+                .unwrap();
+        assert!(!engine.allowlist_only); // base value, no reload has run yet
+
+        engine.last_config_reload = Instant::now() - CONFIG_RELOAD_INTERVAL - Duration::from_secs(1);
+        engine.maybe_reload_config();
+        assert!(engine.allowlist_only); // schedule window is active -> forced on
+
+        // Clearing the file and reloading again should revert it - a
+        // schedule window only adds policy on top of the base value, and an
+        // empty schedule means nothing is currently forcing it on.
+        std::fs::write(dir.join("schedule.yml"), "[]\n").unwrap();
+        engine.last_config_reload = Instant::now() - CONFIG_RELOAD_INTERVAL - Duration::from_secs(1);
+        engine.maybe_reload_config();
+        assert!(!engine.allowlist_only);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

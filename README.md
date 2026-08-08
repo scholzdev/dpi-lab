@@ -106,9 +106,12 @@ file and edits it as JSON (mirrors the YAML shape 1:1 - a flat list stays a
 JSON array, `asn.yml`'s `{cidr,asn,name}` entries stay objects, etc.).
 
 **Hot-reload**: `sni`/`ja3`/`ja3s`/`ja4`/`allowlist`/`probe_targets`/`asn`/
-`handshakes`/`doh_providers`/`cannon` are polled and re-read from disk every
-5s while dpi-lab runs - edit through the UI, wait a few seconds, it's live,
-no restart. `ip.yml`/`--block-asn`/lockdown state are **not** hot-reloaded
+`handshakes`/`doh_providers`/`cannon`/`schedule` are polled and re-read from
+disk every 5s while dpi-lab runs - edit through the UI, wait a few seconds,
+it's live, no restart. `schedule.yml` (new time-window-based policy - see
+`config/schedule.yml`'s own comments) is one of the reloaded files too, so
+editing a window takes effect within the same ~5s. `ip.yml`/`--block-asn`/
+lockdown state are **not** hot-reloaded
 (they're merged with `escalated_ip.yml`/CLI flags and actively mutated by
 the auto-escalation logic at runtime - a wholesale reload would fight that)
 - those still need a restart. The events table polls `/api/events` every

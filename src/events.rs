@@ -88,6 +88,20 @@ fn format_unix_secs(secs: u64) -> String {
     format!("{y:04}-{m_num:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+/// (weekday, hour, minute) for a unix timestamp - weekday 0=Sunday..6=Saturday.
+/// 1970-01-01 (day 0) was a Thursday, so `(days_since_epoch + 4) % 7` is the
+/// standard closed-form for this - reused by engine.rs's scheduled-policy
+/// feature so there's one day/time extraction in this codebase, not two
+/// slightly-different copies (the date math above already computes
+/// days-since-epoch and time-of-day, this just adds the weekday remainder).
+pub(crate) fn weekday_hour_minute(secs: u64) -> (u8, u8, u8) {
+    let (days, time_of_day) = (secs / 86400, secs % 86400);
+    let weekday = ((days + 4) % 7) as u8;
+    let hour = (time_of_day / 3600) as u8;
+    let minute = ((time_of_day % 3600) / 60) as u8;
+    (weekday, hour, minute)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +153,17 @@ mod tests {
         assert_eq!(format_unix_secs(1_609_459_200), "2021-01-01T00:00:00Z");
         assert_eq!(format_unix_secs(1_609_459_200 + 3661), "2021-01-01T01:01:01Z");
         assert_eq!(format_unix_secs(1_735_689_599), "2024-12-31T23:59:59Z"); // just before a year boundary
+    }
+
+    #[test]
+    fn weekday_hour_minute_matches_known_timestamps() {
+        // 1970-01-01T00:00:00Z was a Thursday.
+        assert_eq!(weekday_hour_minute(0), (4, 0, 0));
+        // 2021-01-01T00:00:00Z was a Friday.
+        assert_eq!(weekday_hour_minute(1_609_459_200), (5, 0, 0));
+        // Same day, 14:35.
+        assert_eq!(weekday_hour_minute(1_609_459_200 + 14 * 3600 + 35 * 60), (5, 14, 35));
+        // 2026-08-08T00:00:00Z was a Saturday - today, as of this session.
+        assert_eq!(weekday_hour_minute(1_786_147_200).0, 6);
     }
 }

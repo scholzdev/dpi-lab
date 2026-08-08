@@ -120,6 +120,74 @@ pub fn load_asn_ranges(path: &Path) -> Vec<crate::asn::AsnRange> {
     }
 }
 
+/// One time window from config/schedule.yml, naming which flags to force on
+/// while it's active - e.g. flip to default-deny mode overnight. `days`
+/// empty = every day; entries matched case-insensitively against a 3-letter
+/// prefix ("Fri"/"friday" both match). `end` < `start` wraps past midnight.
+///
+/// ponytail: the day-of-week check only looks at *today's* weekday, not
+/// which day a wrapping window "morally" belongs to - a Fri-22:00-to-
+/// Sat-06:00 window needs `days: [Fri, Sat]` listed, not just `[Fri]`,
+/// since the post-midnight portion is checked against Saturday's date.
+/// Documented, not silently wrong.
+#[derive(serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct ScheduleWindow {
+    #[serde(default)]
+    pub days: Vec<String>,
+    pub start: String,
+    pub end: String,
+    #[serde(default)]
+    pub allowlist_only: bool,
+    #[serde(default)]
+    pub block_quic: bool,
+}
+
+impl ScheduleWindow {
+    /// Whether this window covers the given (weekday 0=Sunday..6=Saturday,
+    /// hour, minute) - see `events::weekday_hour_minute` for how callers get
+    /// those from a timestamp.
+    pub fn is_active(&self, weekday: u8, hour: u8, minute: u8) -> bool {
+        if !self.days.is_empty() {
+            const NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+            let today = NAMES[weekday as usize % 7];
+            if !self.days.iter().any(|d| d.to_lowercase().starts_with(today)) {
+                return false;
+            }
+        }
+        let (Some(start), Some(end)) = (parse_hhmm(&self.start), parse_hhmm(&self.end)) else { return false };
+        let now = hour as u16 * 60 + minute as u16;
+        if start <= end {
+            now >= start && now < end
+        } else {
+            now >= start || now < end // wraps past midnight
+        }
+    }
+}
+
+/// "HH:MM" -> minutes since midnight, `None` on anything malformed.
+fn parse_hhmm(s: &str) -> Option<u16> {
+    let (h, m) = s.split_once(':')?;
+    let h: u16 = h.parse().ok()?;
+    let m: u16 = m.parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
+/// Load config/schedule.yml - a list of time windows (see `ScheduleWindow`).
+/// Same missing/malformed handling as everything else here.
+pub fn load_schedule(path: &Path) -> Vec<ScheduleWindow> {
+    let Ok(contents) = std::fs::read_to_string(path) else { return Vec::new() };
+    match serde_yaml::from_str(&contents) {
+        Ok(windows) => windows,
+        Err(e) => {
+            log::error!("[config] failed to parse {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +335,70 @@ mod tests {
         // "SSH-" anchor being transposed to "SHS-" (wrong bytes, same rule name).
         let ssh = rules.iter().find(|r| r.name == "ssh-version-exchange").unwrap();
         assert_eq!(ssh.anchors[0].bytes, b"SSH-");
+    }
+
+    #[test]
+    fn loads_schedule() {
+        let path = tempfile("loads_schedule");
+        std::fs::write(&path, "- days: [Fri, Sat]\n  start: \"22:00\"\n  end: \"06:00\"\n  allowlist_only: true\n").unwrap();
+        let windows = load_schedule(&path);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].days, vec!["Fri", "Sat"]);
+        assert!(windows[0].allowlist_only);
+        assert!(!windows[0].block_quic); // defaulted, not specified
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_schedule_is_empty_list() {
+        assert!(load_schedule(Path::new("/nonexistent/schedule.yml")).is_empty());
+    }
+
+    fn window(days: &[&str], start: &str, end: &str) -> ScheduleWindow {
+        ScheduleWindow {
+            days: days.iter().map(|s| s.to_string()).collect(),
+            start: start.to_string(),
+            end: end.to_string(),
+            allowlist_only: true,
+            block_quic: false,
+        }
+    }
+
+    #[test]
+    fn window_matches_any_day_when_days_empty() {
+        let w = window(&[], "09:00", "17:00");
+        assert!(w.is_active(0, 12, 0)); // Sunday, midday
+        assert!(w.is_active(6, 12, 0)); // Saturday, midday
+    }
+
+    #[test]
+    fn window_respects_day_list_case_insensitively() {
+        let w = window(&["fri", "SAT"], "00:00", "23:59");
+        assert!(w.is_active(5, 12, 0)); // Friday
+        assert!(w.is_active(6, 12, 0)); // Saturday
+        assert!(!w.is_active(1, 12, 0)); // Monday
+    }
+
+    #[test]
+    fn window_wraps_past_midnight() {
+        let w = window(&[], "22:00", "06:00");
+        assert!(w.is_active(5, 23, 30)); // 23:30, within the window
+        assert!(w.is_active(5, 2, 0)); // 02:00, past midnight, still within
+        assert!(!w.is_active(5, 12, 0)); // midday, outside
+    }
+
+    #[test]
+    fn window_non_wrapping_excludes_end_boundary() {
+        let w = window(&[], "09:00", "17:00");
+        assert!(w.is_active(1, 9, 0)); // start inclusive
+        assert!(!w.is_active(1, 17, 0)); // end exclusive
+        assert!(!w.is_active(1, 8, 59));
+    }
+
+    #[test]
+    fn malformed_time_never_matches() {
+        let w = window(&[], "not-a-time", "17:00");
+        assert!(!w.is_active(1, 12, 0));
     }
 
     // unique-per-test filename in the OS temp dir - tests run in parallel
