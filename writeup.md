@@ -9,9 +9,13 @@ fingerprinting), active connection reset (RST) injection, DNS response
 spoofing, entropy-based detection of protocols designed to evade signature
 matching, active probing to confirm a suspected protocol before acting on it,
 Great-Cannon-style HTTP response injection between two owned hosts, adaptive
-IP-reputation blocking with automatic expiry, and (Linux only) genuine
-in-path enforcement via NFQUEUE - the one mechanism here that can guarantee
-a block rather than race for one. The goal
+IP-reputation blocking with automatic expiry, genuine in-path enforcement
+via NFQUEUE (Linux) - the one off-path mechanism here that can guarantee a
+block rather than race for one - and, on both macOS and Linux, transparent
+TLS-intercepting keyword censorship of HTTPS itself (request blocking and
+in-place response redaction, HTTP/1.1 and h2), the one mechanism that
+operates on encrypted content directly rather than metadata around it. The
+goal
 is not to replicate GFW's scale or deployment model, but to build and
 empirically verify each mechanism in isolation, against traffic I fully
 control, as a concrete demonstration of understanding for network security
@@ -62,6 +66,46 @@ client's own interface. Running per-device (as this project does, on a
 laptop's own NIC) only affects that device's own traffic - this distinction
 came up directly during testing and is worth stating precisely rather than
 hand-waving "runs on every interface."
+
+**What actually separates this from a national-scale deployment.** Every
+mechanism in this project - SNI/keyword matching, TLS interception,
+allowlist-vs-blacklist policy - is architecturally the same primitive a
+real censor uses; the gap to "government level" is not more code. Four
+things are missing, none of them a software feature:
+
+1. **Throughput.** A national gateway inspects traffic for hundreds of
+   millions of concurrent users across every border link simultaneously.
+   That's done with purpose-built ASIC packet processors operating at
+   Tbps, not general-purpose CPUs running userspace Rust - the TPROXY/pf
+   path `--mitm` uses (§3.13) tops out at maybe thousands of concurrent
+   connections on commodity hardware before the extra userspace hop
+   becomes the bottleneck. This is a hardware-procurement problem, not
+   something a code change addresses.
+2. **Legal/coercive CA trust vs. consent - the actual wall, not a scale
+   issue.** `--mitm`'s TLS interception (§3.13) only works against a
+   client that has *voluntarily* chosen to trust the signing CA - in this
+   project, `mkcert`'s locally-generated root, installed by me, on my own
+   Mac. A government cannot ask a population to opt in; regimes that have
+   tried mandating a state root CA for all HTTPS traffic (Kazakhstan,
+   2019 - see §5) had it detected and blocked by every major browser
+   within days, because CA trust is policed by an ecosystem (the CA/
+   Browser Forum, each browser's Root Program) specifically to prevent
+   exactly this. The mechanism is identical; the difference is coercion
+   (mandate installation, or an ISP silently intercepting without
+   consent) vs. informed consent on infrastructure I own - which is also
+   the line between a security lab and conducting traffic interception
+   without consent, a line this project does not cross.
+3. **Chokepoint position.** A real deployment sits at the handful of
+   international gateway links a country's traffic actually crosses - a
+   position that comes from owning or regulating that infrastructure, not
+   from running a box in a homelab (§1's chokepoint paragraph above
+   already makes this point for the passive/inline mechanisms; it applies
+   identically to `--mitm`).
+4. **Allowlist vs. blacklist policy.** Large-scale censors increasingly
+   default-deny (allow known-good, block everything else) rather than
+   blacklist keywords one at a time - `--allowlist-only` already
+   implements the correct policy shape here; going wider is a config
+   change, not new capability.
 
 **Off-path vs. inline, and why it matters for what each mechanism can do.**
 Everything except throttling here is off-path: it can only forge *additional*
@@ -496,6 +540,82 @@ every flow (correct, but wasteful past lab scale) rather than implementing
 that bypass optimization - both are documented follow-ups, not oversights,
 consistent with how every other simplification in this project is marked.
 
+### 3.13 Transparent TLS-intercepting MITM for HTTPS keyword censorship (`--mitm`)
+
+Every mechanism above that inspects payload content is blind past the TLS
+handshake: §3.1's keyword matching and query-string scanning only ever see
+a plaintext HTTP request, and a TLS ClientHello exposes SNI (the domain)
+but nothing about the actual request - the encrypted part is, by design,
+unreadable to a passive observer no matter how the packet is captured.
+Reaching a query string like `?q=<keyword>` inside an HTTPS request
+requires actually terminating the TLS session in the middle: presenting
+the client a certificate it trusts for the real domain, decrypting,
+inspecting, re-encrypting to the actual origin. `src/mitm.rs` implements
+this as its own standalone mode (`--mitm`, independent of `--inline`), the
+one mechanism in this project that operates on encrypted content directly
+rather than on metadata around it.
+
+**Interception mechanism, one API over two platform-specific backends.**
+Traffic has to reach the proxy before TLS can be terminated at all,
+and the two platforms this project targets have no shared kernel
+primitive for that. Linux uses TPROXY (an `nftables` `tproxy to` rule in
+the `prerouting` hook + policy routing + a raw `IP_TRANSPARENT` socket) -
+the property that matters is that a TPROXY-bound socket's `local_addr()`
+already *is* the original destination, no extra syscall needed to recover
+it. macOS has no TPROXY; the equivalent is PF's `rdr-to`, which - unlike
+TPROXY - rewrites the destination before delivery, so recovering the real
+target needs a `DIOCNATLOOK` ioctl against `/dev/pf`. Apple doesn't ship
+`pfvar.h` in the public SDK, so the `pfioc_natlook` struct layout used here
+was verified directly against Apple's own open-source xnu source
+(`bsd/net/pfvar.h`) rather than guessed, and the `direction`/`af` field
+values were cross-checked against sshuttle's macOS PF backend
+(`sshuttle/methods/pf.py`, §5) - a real, widely-used open-source tool that
+solves the identical recovery problem, read for the exact ioctl argument
+shape the same way OpenGFW was read for `--inline`'s architecture (§3.12):
+technique reused and attributed, no code copied.
+
+**Cert issuance and the trust boundary that actually matters.** Once a
+connection is selected for interception (SNI is a literal entry in
+`config/mitm_domains.yml` - everything else is blind-relayed at the raw
+TCP level, untouched, no decryption attempted), `rcgen` signs a fresh leaf
+certificate for that hostname on the fly, using a CA loaded from
+`config/mitm_ca.{crt,key}`. Every test here used `mkcert`'s local
+development CA, which is only trusted because `mkcert` installed it into
+this Mac's own system keychain - it is not trusted by any other device,
+and was never distributed to one. This is the exact mechanism §1's
+CA-trust discussion refers to: the code has no notion of "who trusts this
+CA and why," it just uses whatever's configured, which is precisely why
+that trust boundary is a human/consent decision made once outside the
+program, not a parameter the tool decides for itself.
+
+**Protocol coverage and the two enforcement points.** Both HTTP/1.1 and
+HTTP/2 are supported for the request-side keyword check - the h2 case
+reuses `h2.rs`'s existing HPACK/frame parser (originally written for
+`:authority` extraction, §3.1) rather than a new parser, pulling the
+`:path` pseudo-header (which, unlike HTTP/1.1's split request-line, already
+carries the full target including any query string). A match on the
+request kills the connection outright (`[mitm-keyword]`). A match in the
+*response* body instead redacts just the matched bytes in place
+(`[mitm-redact]`) and forwards the rest of the page - the same-length
+overwrite means `Content-Length` and chunk-size headers never need
+rewriting, at the cost of a documented, deliberate scope cut: response
+redaction is HTTP/1.1 only (h2 response rewriting would need to re-encode
+through HPACK/frame boundaries, not built), and the outgoing request's
+`Accept-Encoding` is forced to `identity` rather than implementing
+gzip/brotli decompress-scan-recompress.
+
+**QUIC is a documented bypass, closed by default, not silently missed.**
+Both interception rules match TCP only. A client that successfully
+negotiates QUIC (UDP, its own independent TLS 1.3 handshake) talks
+straight to the real origin, invisible to this proxy entirely - and QUIC
+can't be intercepted the same way without an entire separate QUIC-
+terminating proxy stack, genuinely different wire framing from anything
+built here. `--mitm` addresses this the same way `--block-quic` already
+does for the passive path (§1): blanket-drop UDP:443 (via the existing
+`lockdown` mechanism) so a QUIC-capable client falls back to the TCP+TLS
+path this proxy can actually see, enabled by default, `--no-block-quic` to
+opt out.
+
 ## 4. Evaluation
 
 ### 4.1 A real false-positive, found and fixed during testing
@@ -672,6 +792,23 @@ All of the following were run live, not simulated:
   open-source GFW implementation; its `io/nfqueue.go` was read for
   architecture (nftables `queue` + NFQUEUE verdict model) before writing
   `src/inline.rs` independently in Rust, per §3.12.
+- sshuttle (github.com/sshuttle/sshuttle, `sshuttle/methods/pf.py`) - its
+  macOS PF backend was read for the `DIOCNATLOOK`/`pfioc_natlook` ioctl
+  argument shape (struct layout separately verified against Apple's xnu
+  `pfvar.h`, since it isn't in the public SDK) before writing `--mitm`'s
+  macOS backend independently, per §3.13.
+- Marlinspike, M. (2009, and the `sslstrip`/corporate-TLS-inspection-proxy
+  literature broadly) - the TLS-termination-in-the-middle technique
+  `--mitm` implements (§3.13) is the same mechanism corporate HTTPS-
+  inspecting firewalls and antivirus products use, not novel; what's novel
+  here, if anything, is applying it to keyword censorship specifically.
+- Marczak, B. et al. (Citizen Lab, 2019). *Kazakhstan Blocks Encrypted
+  Traffic, Certificate Authority Involved.* - documents the 2019 mandatory-
+  root-CA incident cited in §1's deployment-scale discussion: the CA
+  ecosystem's response (detection and blocking within days by every major
+  browser) is the concrete precedent for why coercive CA distribution,
+  unlike this project's opt-in local `mkcert` CA, doesn't survive contact
+  with the real world.
 
 ## 6. Ethics statement
 
@@ -694,7 +831,19 @@ traffic transits that gateway, not only the host itself. It was designed and
 (to the extent tested so far) only ever run against a single-person home
 network - on a shared network, honoring "own lab only" would require scoping
 enforcement to specific devices rather than the whole gateway, a distinction
-raised and worked through explicitly before any inline testing began. This
-project studies and reproduces documented censorship mechanisms for
-security-research purposes; it is not, and is not intended to become, a
-deployable interception or censorship tool.
+raised and worked through explicitly before any inline testing began.
+`--mitm` (§3.13) carries the sharpest version of that same risk: unlike
+every other mechanism here, its CA private key can mint a certificate a
+trusting client will accept for *any* hostname, not only the ones in
+`config/mitm_domains.yml` - the allow-list constrains what this program
+chooses to do with that ability, not what the key itself is capable of.
+That key was never generated for or distributed to anyone but me
+(`mkcert`'s local development CA, installed only in this Mac's own system
+keychain); it is treated as a real secret (`config/mitm_ca.key` is
+git-ignored, documented as root-only-readable in `mitm.rs`'s header
+comment), and §1 discusses at length why the coercive distribution a real
+deployment would require is where this technique actually breaks down,
+not a line this project approaches. This project studies and reproduces
+documented censorship mechanisms for security-research purposes; it is
+not, and is not intended to become, a deployable interception or
+censorship tool.
