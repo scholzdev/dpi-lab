@@ -44,6 +44,13 @@
 // enforcement instead of passive capture + off-path racing, see src/inline.rs.
 // Run as: sudo ./target/debug/dpi-lab --inline (no interface arg - nftables
 // picks up FORWARD traffic directly, this machine must be the actual gateway).
+// --inline --downgrade-tls13: forces TLS 1.3 ClientHellos to 1.2 in place
+// (flips the supported_versions extension's 0x0304 entries to 0x0303, never
+// changes packet length - see classify::mangle_supported_versions_in_place).
+// The downgrade itself is real and observable on the wire, but RFC 8446
+// SS4.1.3 gives every TLS-1.3-capable client a sentinel to detect exactly
+// this and abort - real-world effect is confined to non-conformant/legacy
+// TLS stacks, see example.md.
 // (no arg = list interfaces)
 mod asn;
 mod cannon;
@@ -109,6 +116,10 @@ fn run_inline(args: &[String]) {
     let mut signatures = config::load_list(&config_dir.join("signatures.yml"));
     signatures.extend(flag_values(args, "--block-sig"));
     let handshake_rules = config::load_handshake_rules(&config_dir.join("handshakes.yml"));
+    let downgrade_tls13 = args.iter().any(|a| a == "--downgrade-tls13");
+    if downgrade_tls13 {
+        println!("[inline] --downgrade-tls13: forcing TLS 1.3 ClientHellos to 1.2 - RFC 8446 SS4.1.3's downgrade sentinel means any conformant modern client detects and aborts this rather than silently downgrading (see example.md)");
+    }
 
     let classifier = inline::InlineClassifier {
         sigs: classify::Signatures::new(&signatures),
@@ -116,6 +127,7 @@ fn run_inline(args: &[String]) {
         blocked_ja3,
         blocked_ip,
         handshake_rules,
+        downgrade_tls13,
     };
 
     ctrlc::set_handler(|| {

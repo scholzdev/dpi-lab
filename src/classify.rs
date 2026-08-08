@@ -135,6 +135,91 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello> {
     Some(ClientHello { version, sni, cipher_suites, extensions, curves, ec_point_formats, has_ech })
 }
 
+/// In-place TLS 1.3->1.2 forced downgrade (`--inline --downgrade-tls13`
+/// only - see engine.rs's off-path/`--inline` split, this needs to mangle a
+/// live packet). Flips every `0x0304` (TLS 1.3) entry inside the
+/// `supported_versions` extension (0x002b, RFC 8446 SS4.2.1: list_len(1) +
+/// u16 version entries) to `0x0303` (TLS 1.2), byte-for-byte in place -
+/// deliberately never removes the extension or changes any length field.
+/// Shrinking the record would shrink this TCP segment's payload, which
+/// desyncs every later real segment from this flow (the sender computed
+/// their sequence numbers against its own, unmangled, longer payload) -
+/// same-length-in-place editing has no such resegmentation problem, at the
+/// cost of only being able to substitute, never delete.
+///
+/// Returns whether anything changed - `false` (buffer untouched) covers
+/// "not a ClientHello", "no supported_versions extension" (already <=1.2),
+/// and "extension present but no 1.3 entry to strip", all safe no-ops.
+///
+/// Ceiling, not hidden: RFC 8446 SS4.1.3 has a downgrade-detection sentinel -
+/// a TLS-1.3-capable server that ends up negotiating <=1.2 stamps the last 8
+/// bytes of ServerHello.random with a fixed value, and TLS-1.3-capable
+/// clients (every current browser, curl, OpenSSL 1.1.1+, ...) check for it
+/// and abort specifically to catch this attack. This does force the
+/// negotiation down (real, observable on the wire) - RFC-conformant modern
+/// clients then refuse it rather than silently downgrading.
+pub fn mangle_supported_versions_in_place(record: &mut [u8]) -> bool {
+    let Some(rec_type) = record.first().copied() else { return false };
+    if rec_type != 0x16 {
+        return false;
+    }
+    let Some(rec_len_bytes) = record.get(3..5) else { return false };
+    let rec_len = u16::from_be_bytes([rec_len_bytes[0], rec_len_bytes[1]]) as usize;
+    let Some(body) = record.get_mut(5..5 + rec_len) else { return false };
+
+    if body.first().copied() != Some(0x01) {
+        return false; // not a ClientHello
+    }
+    let hs_len = u32::from_be_bytes([0, body[1], body[2], body[3]]) as usize;
+    let Some(hs) = body.get_mut(4..4 + hs_len) else { return false };
+
+    // Same field walk as parse_client_hello, just skipping to compute an
+    // offset instead of extracting values - see that function for the
+    // field-by-field byte layout this mirrors.
+    let mut p = 2 + 32;
+    let Some(&sid_len) = hs.get(p) else { return false };
+    p += 1 + sid_len as usize;
+
+    let Some(cs_len_bytes) = hs.get(p..p + 2) else { return false };
+    let cs_len = u16::from_be_bytes([cs_len_bytes[0], cs_len_bytes[1]]) as usize;
+    p += 2 + cs_len;
+
+    let Some(&cm_len) = hs.get(p) else { return false };
+    p += 1 + cm_len as usize;
+
+    let Some(ext_total_bytes) = hs.get(p..p + 2) else { return false };
+    let ext_total = u16::from_be_bytes([ext_total_bytes[0], ext_total_bytes[1]]) as usize;
+    p += 2;
+    let ext_end = p + ext_total;
+
+    let mut changed = false;
+    while p + 4 <= ext_end && p + 4 <= hs.len() {
+        let ext_type = u16::from_be_bytes([hs[p], hs[p + 1]]);
+        let ext_len = u16::from_be_bytes([hs[p + 2], hs[p + 3]]) as usize;
+        if hs.get(p + 4..p + 4 + ext_len).is_none() {
+            return changed; // truncated - stop, keep whatever was already flipped
+        }
+        if ext_type == 0x002b {
+            let Some(&list_len) = hs.get(p + 4) else { return changed };
+            let entries_start = p + 5;
+            let entries_end = entries_start + list_len as usize;
+            if entries_end > p + 4 + ext_len {
+                return changed; // malformed list length - leave alone
+            }
+            let mut e = entries_start;
+            while e + 2 <= entries_end {
+                if hs[e] == 0x03 && hs[e + 1] == 0x04 {
+                    hs[e + 1] = 0x03; // TLS 1.3 -> TLS 1.2
+                    changed = true;
+                }
+                e += 2;
+            }
+        }
+        p += 4 + ext_len;
+    }
+    changed
+}
+
 /// Extract just the SNI hostname - see `parse_client_hello` for details.
 pub fn parse_sni(data: &[u8]) -> Option<String> {
     parse_client_hello(data)?.sni
@@ -542,6 +627,76 @@ mod tests {
         record.extend_from_slice(&handshake);
 
         assert_eq!(parse_sni(&record).unwrap(), "example.com");
+    }
+
+    /// Build a minimal ClientHello record whose only extension is
+    /// `supported_versions` (0x002b) listing the given u16 version entries
+    /// in order (e.g. GREASE, 0x0304, 0x0303) - same builder shape as
+    /// `tls_sni_extraction` above, just parameterized on this one extension.
+    fn client_hello_with_supported_versions(versions: &[u16]) -> Vec<u8> {
+        let mut entries = Vec::new();
+        for v in versions {
+            entries.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut ext_data = vec![entries.len() as u8];
+        ext_data.extend_from_slice(&entries);
+
+        let mut ext = vec![0x00, 0x2b]; // extension type = supported_versions
+        ext.extend_from_slice(&(ext_data.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&ext_data);
+
+        let mut hs = vec![];
+        hs.extend_from_slice(&[0x03, 0x03]);
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.push(0);
+        hs.extend_from_slice(&(2u16).to_be_bytes());
+        hs.extend_from_slice(&[0x13, 0x01]);
+        hs.push(1);
+        hs.push(0);
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(hs.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&hs);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn downgrade_strips_tls13_leaves_grease_and_length_fields_untouched() {
+        let mut record = client_hello_with_supported_versions(&[0x0a0a, 0x0304, 0x0303]);
+        let before = record.clone();
+        assert!(mangle_supported_versions_in_place(&mut record));
+        assert_eq!(record.len(), before.len()); // no length field anywhere changed
+
+        // Only the 0x0304 entry's low byte flips; everything else - including
+        // the GREASE entry right next to it - is byte-for-byte identical.
+        let mut expected = before.clone();
+        let flip_at = expected.windows(2).position(|w| w == [0x03, 0x04]).unwrap();
+        expected[flip_at + 1] = 0x03;
+        assert_eq!(record, expected);
+
+        assert_eq!(parse_client_hello(&record).unwrap().sni, None); // still a valid, parseable ClientHello
+    }
+
+    #[test]
+    fn downgrade_noop_when_no_tls13_offered() {
+        let mut record = client_hello_with_supported_versions(&[0x0303, 0x0302]);
+        let before = record.clone();
+        assert!(!mangle_supported_versions_in_place(&mut record));
+        assert_eq!(record, before);
+    }
+
+    #[test]
+    fn downgrade_noop_on_non_client_hello() {
+        let mut data = b"GET / HTTP/1.1\r\n".to_vec();
+        let before = data.clone();
+        assert!(!mangle_supported_versions_in_place(&mut data));
+        assert_eq!(data, before);
     }
 
     #[test]

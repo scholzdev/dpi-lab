@@ -29,7 +29,7 @@ use nfq::{Queue, Verdict};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
-use pnet::packet::tcp::TcpPacket;
+use pnet::packet::tcp::{ipv4_checksum as tcp_checksum_v4, ipv6_checksum as tcp_checksum_v6, MutableTcpPacket, TcpPacket};
 use pnet::packet::udp::UdpPacket;
 use pnet::packet::Packet;
 use std::net::IpAddr;
@@ -47,6 +47,11 @@ pub struct InlineClassifier {
     pub blocked_ip: Vec<String>,
     pub sigs: classify::Signatures,
     pub handshake_rules: Vec<HandshakeRule>,
+    /// The one non-block-decision field here: forces TLS 1.3 ClientHellos
+    /// down to 1.2 in place (see `mangle_tls13_downgrade`) instead of
+    /// deciding accept/drop. Reused this struct rather than threading a
+    /// second config path through `run()` for one flag.
+    pub downgrade_tls13: bool,
 }
 
 impl InlineClassifier {
@@ -129,14 +134,86 @@ pub fn run(classifier: &InlineClassifier) -> std::io::Result<()> {
 
     loop {
         let mut msg = queue.recv()?;
+        if classifier.downgrade_tls13 {
+            if let Some(reason) = mangle_tls13_downgrade(msg.get_payload_mut()) {
+                println!("  [inline] {reason}");
+            }
+        }
         let payload = msg.get_payload();
         let verdict = decide(classifier, payload);
         if let Some(reason) = &verdict {
             println!("  [inline] dropped ({reason})");
         }
+        // get_payload_mut's edits above (if any) are only committed to the
+        // kernel on a non-Drop verdict (nfq crate's own doc comment on that
+        // method) - a packet that also matches a block rule still drops,
+        // same as if it had never been mangled.
         msg.set_verdict(if verdict.is_some() { Verdict::Drop } else { Verdict::Accept });
         queue.verdict(msg)?;
     }
+}
+
+/// Force TLS 1.3 down to 1.2 in place, if `ip_payload` carries a ClientHello
+/// offering it - see `classify::mangle_supported_versions_in_place` for the
+/// byte-level mechanics and why this never changes any length (shrinking the
+/// payload would desync every later real segment of this flow). IPv6 and
+/// IPv4 both handled, same recompute-only-the-TCP-checksum reasoning either
+/// way (the IP header itself is never touched, so its checksum - v4 only,
+/// v6 has none - doesn't need touching). Returns a log line on a hit, so
+/// `run()`'s loop only prints when something actually changed.
+fn mangle_tls13_downgrade(ip_payload: &mut [u8]) -> Option<String> {
+    match ip_payload.first().map(|b| b >> 4) {
+        Some(4) => {
+            let ip = Ipv4Packet::new(ip_payload)?;
+            if ip.get_next_level_protocol() != IpNextHeaderProtocols::Tcp {
+                return None;
+            }
+            let (src4, dst4) = (ip.get_source(), ip.get_destination());
+            let ip_hdr_len = (ip.get_header_length() as usize) * 4;
+            let (sport, dport) = tcp_endpoints(ip_payload.get(ip_hdr_len..)?)?;
+            let data_offset = (TcpPacket::new(ip_payload.get(ip_hdr_len..)?)?.get_data_offset() as usize) * 4;
+            let payload_start = ip_hdr_len + data_offset;
+            if !classify::mangle_supported_versions_in_place(ip_payload.get_mut(payload_start..)?) {
+                return None;
+            }
+            let mut tcp = MutableTcpPacket::new(&mut ip_payload[ip_hdr_len..])?;
+            let cksum = tcp_checksum_v4(&tcp.to_immutable(), &src4, &dst4);
+            tcp.set_checksum(cksum);
+            Some(format!(
+                "downgraded {}:{sport} -> {}:{dport} (stripped TLS 1.3 from supported_versions)",
+                IpAddr::V4(src4),
+                IpAddr::V4(dst4)
+            ))
+        }
+        Some(6) => {
+            let ip = Ipv6Packet::new(ip_payload)?;
+            if ip.get_next_header() != IpNextHeaderProtocols::Tcp {
+                return None;
+            }
+            let (src6, dst6) = (ip.get_source(), ip.get_destination());
+            const IPV6_HDR_LEN: usize = 40; // fixed - extension headers not walked, matches decide()'s scope
+            let (sport, dport) = tcp_endpoints(ip_payload.get(IPV6_HDR_LEN..)?)?;
+            let data_offset = (TcpPacket::new(ip_payload.get(IPV6_HDR_LEN..)?)?.get_data_offset() as usize) * 4;
+            let payload_start = IPV6_HDR_LEN + data_offset;
+            if !classify::mangle_supported_versions_in_place(ip_payload.get_mut(payload_start..)?) {
+                return None;
+            }
+            let mut tcp = MutableTcpPacket::new(&mut ip_payload[IPV6_HDR_LEN..])?;
+            let cksum = tcp_checksum_v6(&tcp.to_immutable(), &src6, &dst6);
+            tcp.set_checksum(cksum);
+            Some(format!(
+                "downgraded {}:{sport} -> {}:{dport} (stripped TLS 1.3 from supported_versions)",
+                IpAddr::V6(src6),
+                IpAddr::V6(dst6)
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn tcp_endpoints(tcp_bytes: &[u8]) -> Option<(u16, u16)> {
+    let tcp = TcpPacket::new(tcp_bytes)?;
+    Some((tcp.get_source(), tcp.get_destination()))
 }
 
 /// Parse the raw IP packet nfq hands us and run it through the classifier.
@@ -194,6 +271,7 @@ mod tests {
                 anchors: vec![classify::HandshakeAnchor { offset: 0, bytes: vec![1, 0, 0, 0] }],
                 protocol: Some("udp".to_string()),
             }],
+            downgrade_tls13: false,
         }
     }
 
@@ -250,5 +328,110 @@ mod tests {
         let src: IpAddr = "10.27.0.5".parse().unwrap();
         let dst: IpAddr = "1.1.1.1".parse().unwrap();
         assert_eq!(c.classify(src, dst, 1234, 443, "tcp", b"perfectly normal traffic"), None);
+    }
+
+    /// Minimal ClientHello whose only extension is `supported_versions`
+    /// listing the given entries - same shape as
+    /// classify.rs's own test builder of the same purpose, duplicated here
+    /// rather than exposed cross-module for one test fixture.
+    fn client_hello_with_supported_versions(versions: &[u16]) -> Vec<u8> {
+        let mut entries = Vec::new();
+        for v in versions {
+            entries.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut ext_data = vec![entries.len() as u8];
+        ext_data.extend_from_slice(&entries);
+
+        let mut ext = vec![0x00, 0x2b];
+        ext.extend_from_slice(&(ext_data.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&ext_data);
+
+        let mut hs = vec![0x03, 0x03];
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.push(0);
+        hs.extend_from_slice(&(2u16).to_be_bytes());
+        hs.extend_from_slice(&[0x13, 0x01]);
+        hs.push(1);
+        hs.push(0);
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(hs.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&hs);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    /// Wrap a TCP payload in a minimal (no options, 20-byte header) IPv4/TCP
+    /// packet with a correct TCP checksum, mirroring inject.rs's `build_rst`
+    /// test-fixture pattern.
+    fn wrap_ipv4_tcp(payload: &[u8]) -> Vec<u8> {
+        use pnet::packet::ipv4::{checksum as ipv4_checksum, Ipv4Flags, MutableIpv4Packet};
+        use pnet::packet::tcp::TcpFlags;
+        const IP_HDR: usize = 20;
+        const TCP_HDR: usize = 20;
+        let src = std::net::Ipv4Addr::new(10, 0, 0, 1);
+        let dst = std::net::Ipv4Addr::new(10, 0, 0, 2);
+
+        let mut buf = vec![0u8; IP_HDR + TCP_HDR + payload.len()];
+        buf[IP_HDR + TCP_HDR..].copy_from_slice(payload);
+        {
+            let mut tcp = MutableTcpPacket::new(&mut buf[IP_HDR..]).unwrap();
+            tcp.set_source(51234);
+            tcp.set_destination(443);
+            tcp.set_sequence(1);
+            tcp.set_data_offset(5);
+            tcp.set_flags(TcpFlags::ACK);
+            let cksum = tcp_checksum_v4(&tcp.to_immutable(), &src, &dst);
+            tcp.set_checksum(cksum);
+        }
+        {
+            let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length((IP_HDR + TCP_HDR + payload.len()) as u16);
+            ip.set_ttl(64);
+            ip.set_flags(Ipv4Flags::DontFragment);
+            ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+            ip.set_source(src);
+            ip.set_destination(dst);
+            let cksum = ipv4_checksum(&ip.to_immutable());
+            ip.set_checksum(cksum);
+        }
+        buf
+    }
+
+    #[test]
+    fn downgrade_flips_tls13_and_fixes_tcp_checksum() {
+        let hello = client_hello_with_supported_versions(&[0x0a0a, 0x0304, 0x0303]);
+        let mut packet = wrap_ipv4_tcp(&hello);
+        let before_len = packet.len();
+
+        let reason = mangle_tls13_downgrade(&mut packet);
+        assert!(reason.unwrap().contains("downgraded"));
+        assert_eq!(packet.len(), before_len); // never resegments
+
+        // TCP payload no longer offers 0x0304.
+        let tcp = TcpPacket::new(&packet[20..]).unwrap();
+        assert!(!tcp.payload().windows(2).any(|w| w == [0x03, 0x04]));
+
+        // Checksum in the buffer matches a fresh recomputation - i.e. it was
+        // actually updated to match the mangled bytes, not left stale.
+        let src = std::net::Ipv4Addr::new(10, 0, 0, 1);
+        let dst = std::net::Ipv4Addr::new(10, 0, 0, 2);
+        let fresh = tcp_checksum_v4(&tcp, &src, &dst);
+        assert_eq!(tcp.get_checksum(), fresh);
+    }
+
+    #[test]
+    fn downgrade_noop_on_non_tls_payload_leaves_packet_byte_identical() {
+        let mut packet = wrap_ipv4_tcp(b"perfectly normal traffic");
+        let before = packet.clone();
+        assert!(mangle_tls13_downgrade(&mut packet).is_none());
+        assert_eq!(packet, before);
     }
 }
