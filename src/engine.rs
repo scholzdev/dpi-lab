@@ -318,7 +318,16 @@ impl Engine {
 
     pub fn handle_frame_v6(&mut self, ip: &Ipv6Packet) {
         let (src, dst) = (IpAddr::V6(ip.get_source()), IpAddr::V6(ip.get_destination()));
-        self.dispatch(src, dst, ip.get_next_header(), ip.payload());
+        // A packet carrying Hop-by-Hop/Routing/Destination-Options/Fragment
+        // extension headers has the real upper-layer protocol and payload
+        // further in than `get_next_header()`/`payload()` alone would say -
+        // see ipv6ext.rs. Fragment reassembly (when `frag` comes back Some)
+        // is wired in Phase B; for now this just makes non-fragmented
+        // extension-header traffic classify correctly instead of silently
+        // misparsing it as whatever the first extension header's bytes look
+        // like to a TCP/UDP parser.
+        let (proto, payload, _frag) = crate::ipv6ext::walk_ipv6_extensions(ip.get_next_header(), ip.payload());
+        self.dispatch(src, dst, proto, payload);
     }
 
     fn dispatch(&mut self, src: IpAddr, dst: IpAddr, proto: pnet::packet::ip::IpNextHeaderProtocol, payload: &[u8]) {

@@ -61,6 +61,7 @@ mod engine;
 mod h2;
 mod inject;
 mod inline;
+mod ipv6ext;
 mod lockdown;
 mod probe;
 mod quic;

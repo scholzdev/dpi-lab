@@ -186,19 +186,22 @@ fn mangle_tls13_downgrade(ip_payload: &mut [u8]) -> Option<String> {
             ))
         }
         Some(6) => {
+            const IPV6_HDR_LEN: usize = 40;
             let ip = Ipv6Packet::new(ip_payload)?;
-            if ip.get_next_header() != IpNextHeaderProtocols::Tcp {
+            let (src6, dst6) = (ip.get_source(), ip.get_destination());
+            let (proto, ext_len, _frag) =
+                crate::ipv6ext::walk_ipv6_extensions_len(ip.get_next_header(), ip_payload.get(IPV6_HDR_LEN..)?);
+            if proto != IpNextHeaderProtocols::Tcp {
                 return None;
             }
-            let (src6, dst6) = (ip.get_source(), ip.get_destination());
-            const IPV6_HDR_LEN: usize = 40; // fixed - extension headers not walked, matches decide()'s scope
-            let (sport, dport) = tcp_endpoints(ip_payload.get(IPV6_HDR_LEN..)?)?;
-            let data_offset = (TcpPacket::new(ip_payload.get(IPV6_HDR_LEN..)?)?.get_data_offset() as usize) * 4;
-            let payload_start = IPV6_HDR_LEN + data_offset;
+            let tcp_start = IPV6_HDR_LEN + ext_len;
+            let (sport, dport) = tcp_endpoints(ip_payload.get(tcp_start..)?)?;
+            let data_offset = (TcpPacket::new(ip_payload.get(tcp_start..)?)?.get_data_offset() as usize) * 4;
+            let payload_start = tcp_start + data_offset;
             if !classify::mangle_supported_versions_in_place(ip_payload.get_mut(payload_start..)?) {
                 return None;
             }
-            let mut tcp = MutableTcpPacket::new(&mut ip_payload[IPV6_HDR_LEN..])?;
+            let mut tcp = MutableTcpPacket::new(&mut ip_payload[tcp_start..])?;
             let cksum = tcp_checksum_v6(&tcp.to_immutable(), &src6, &dst6);
             tcp.set_checksum(cksum);
             Some(format!(
@@ -229,7 +232,8 @@ fn decide(classifier: &InlineClassifier, ip_payload: &[u8]) -> Option<String> {
         Some(6) => {
             let ip = Ipv6Packet::new(ip_payload)?;
             let (src, dst) = (IpAddr::V6(ip.get_source()), IpAddr::V6(ip.get_destination()));
-            decide_transport(classifier, src, dst, ip.get_next_header(), ip.payload())
+            let (proto, payload, _frag) = crate::ipv6ext::walk_ipv6_extensions(ip.get_next_header(), ip.payload());
+            decide_transport(classifier, src, dst, proto, payload)
         }
         _ => None,
     }
