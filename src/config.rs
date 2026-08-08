@@ -263,6 +263,10 @@ mod tests {
             names,
             vec!["wireguard-handshake-init", "ikev2-sa-init", "openvpn-hard-reset-client-v2", "ssh-version-exchange"]
         );
+        // Byte-content regression guard: names alone wouldn't have caught the
+        // "SSH-" anchor being transposed to "SHS-" (wrong bytes, same rule name).
+        let ssh = rules.iter().find(|r| r.name == "ssh-version-exchange").unwrap();
+        assert_eq!(ssh.anchors[0].bytes, b"SSH-");
     }
 
     // unique-per-test filename in the OS temp dir - tests run in parallel

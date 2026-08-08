@@ -63,7 +63,7 @@
   protocol: tcp
   match:
     - offset: 0
-      bytes: [0x53, 0x48, 0x53, 0x2D] # "SSH-"
+      bytes: [0x53, 0x53, 0x48, 0x2D] # "SSH-"
 
 # Deliberately NOT added: Trojan, VMess, and Shadowsocks (any cipher mode,
 # including the old pre-AEAD "table"/RC4 ones). Investigated for this rule
