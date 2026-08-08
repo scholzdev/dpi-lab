@@ -164,6 +164,7 @@ pub struct Engine {
     trace: bool, // print every raw packet, not just classification/block events
     block_stats: BlockStats,
     escalation: HashMap<IpAddr, (u32, Instant)>, // offense count + window start, per source IP
+    events: crate::events::EventLog, // structured JSONL for the web UI's live dashboard, see events.rs
 }
 
 impl Engine {
@@ -195,6 +196,7 @@ impl Engine {
         block_doh: bool,
         trace: bool,
         block_stats: BlockStats,
+        events_log_path: Option<std::path::PathBuf>,
     ) -> std::io::Result<Self> {
         let injector = if inject_enabled { Some(inject::open_raw_sender()?) } else { None };
         let injector_v6 = if inject_enabled {
@@ -322,6 +324,7 @@ impl Engine {
             trace,
             block_stats,
             escalation: HashMap::new(),
+            events: crate::events::EventLog::new(events_log_path),
         })
     }
 
@@ -522,7 +525,7 @@ impl Engine {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "possible-fragmentation-evasion");
                 }
                 if self.inject_on_detect {
-                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "detect", "possible-fragmentation-evasion");
+                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "detect", "possible-fragmentation-evasion");
                 }
             }
         }
@@ -532,7 +535,7 @@ impl Engine {
             state.ip_checked = true;
             if self.blocked_ip.iter().any(|(rule, _)| ip_rule_matches(rule, &src) || ip_rule_matches(rule, &dst)) {
                 log::info!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport}");
-                block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ip", "");
+                block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "ip", "");
                 if self.lockdown_enabled {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "ip");
                 }
@@ -542,7 +545,7 @@ impl Engine {
                 // in this mode) blocked_ip list. IP/CIDR only for now - SNI
                 // isn't known yet at this point in the flow.
                 log::info!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport} (not on allowlist)");
-                block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "allowlist", "");
+                block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "allowlist", "");
                 if self.lockdown_enabled {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "allowlist");
                 }
@@ -552,7 +555,7 @@ impl Engine {
                 });
                 if let Some((_, asn)) = hit {
                     log::info!("  [asn] blocked flow {src}:{sport} -> {dst}:{dport} (AS{asn})");
-                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "asn", &asn.to_string());
+                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "asn", &asn.to_string());
                     if self.lockdown_enabled {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "asn");
                     }
@@ -566,7 +569,7 @@ impl Engine {
         let scan_buf = &state.stream.delivered[scan_from.min(state.stream.delivered.len())..];
         for hit in self.sigs.matches(scan_buf) {
             log::info!("  [signature] {hit} in {src}:{sport} -> {dst}:{dport}");
-            block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "signature", hit);
+            block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "signature", hit);
             if self.lockdown_enabled {
                 lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "signature");
             }
@@ -591,7 +594,7 @@ impl Engine {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, &rule.name);
                 }
                 if self.inject_on_detect {
-                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "handshake", &rule.name);
+                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "handshake", &rule.name);
                 }
             } else if state.stream.delivered.len() >= 32 {
                 state.handshake_checked = true; // give up - not this protocol
@@ -611,7 +614,7 @@ impl Engine {
                         None => log::info!("  [ja3] {src}:{sport} -> {dst}:{dport}  ja3={hash} client=unknown ({ja3_string})"),
                     }
                     if self.blocked_ja3.iter().any(|h| h == &hash) {
-                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja3", &hash);
+                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "ja3", &hash);
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja3");
                         }
@@ -620,7 +623,7 @@ impl Engine {
                 if let Some(ja4_fp) = classify::ja4(buf) {
                     log::info!("  [ja4] {src}:{sport} -> {dst}:{dport}  ja4={ja4_fp}");
                     if self.blocked_ja4.iter().any(|h| h == &ja4_fp) {
-                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja4", &ja4_fp);
+                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "ja4", &ja4_fp);
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja4");
                         }
@@ -629,7 +632,7 @@ impl Engine {
                 if let Some((_, name)) = self.doh_providers.iter().find(|(rule, _)| ip_rule_matches(rule, &dst)) {
                     log::info!("  [doh] {src}:{sport} -> {dst}:{dport}  known DoH/DoT resolver ({name})");
                     if self.block_doh {
-                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "doh", name);
+                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "doh", name);
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "doh");
                         }
@@ -647,7 +650,7 @@ impl Engine {
                     let outer = ch.sni.as_deref().unwrap_or("none");
                     log::info!("  [ech] {src}:{sport} -> {dst}:{dport}  encrypted_client_hello present, outer/cover sni={outer} (real destination hidden)");
                     if self.block_ech {
-                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ech", outer);
+                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "ech", outer);
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ech");
                         }
@@ -655,7 +658,7 @@ impl Engine {
                 } else if let Some(name) = ch.sni {
                     log::info!("  [sni] {src}:{sport} -> {dst}:{dport}  server_name={name}");
                     if self.blocked_sni.iter().any(|s| s == &name) {
-                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "sni", &name);
+                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "sni", &name);
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "sni");
                         }
@@ -682,7 +685,7 @@ impl Engine {
                         },
                     };
                     if self.inject_on_detect && confirmed {
-                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "detect", label);
+                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "detect", label);
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "detect");
                         }
@@ -701,7 +704,7 @@ impl Engine {
             if let Some(name) = classify::parse_http_host(&state.stream.delivered) {
                 log::info!("  [host] {src}:{sport} -> {dst}:{dport}  host={name}");
                 if self.blocked_sni.iter().any(|s| s == &name) {
-                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "host", &name);
+                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "host", &name);
                     if self.lockdown_enabled {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "host");
                     }
@@ -721,7 +724,7 @@ impl Engine {
             if let Some(names) = classify::parse_tls_certificate_names(&state.stream.delivered) {
                 log::info!("  [cert] {src}:{sport} -> {dst}:{dport}  names={names:?}");
                 if names.iter().any(|n| self.blocked_sni.iter().any(|s| s == n)) {
-                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "cert", &names.join(","));
+                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "cert", &names.join(","));
                     if self.lockdown_enabled {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "cert");
                     }
@@ -744,7 +747,7 @@ impl Engine {
             if let Some((ja3s_string, hash)) = classify::ja3s(&state.stream.delivered) {
                 log::info!("  [ja3s] {src}:{sport} -> {dst}:{dport}  ja3s={hash} ({ja3s_string})");
                 if self.blocked_ja3s.iter().any(|h| h == &hash) {
-                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja3s", &hash);
+                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "ja3s", &hash);
                     if self.lockdown_enabled {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "ja3s");
                     }
@@ -762,7 +765,7 @@ impl Engine {
             if let Some(name) = h2::extract_authority(&state.stream.delivered) {
                 log::info!("  [h2-authority] {src}:{sport} -> {dst}:{dport}  authority={name}");
                 if self.blocked_sni.iter().any(|s| s == &name) {
-                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "h2-authority", &name);
+                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "h2-authority", &name);
                     if self.lockdown_enabled {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "h2-authority");
                     }
@@ -811,6 +814,7 @@ impl Engine {
             if self.lockdown_enabled {
                 lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "allowlist");
             }
+            self.events.emit("allowlist", src, dst, sport, dport, "not on allowlist");
         }
 
         // dport==53: this is a client's outbound query to a resolver at `dst`.
@@ -858,18 +862,25 @@ impl Engine {
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja3");
                         }
+                        self.events.emit("quic-ja3", src, dst, sport, dport, &hash);
                     }
                 }
                 if let Some(ja4_fp) = classify::ja4(&record) {
                     log::info!("  [quic-ja4] {src}:{sport} -> {dst}:{dport}  ja4={ja4_fp}");
-                    if self.blocked_ja4.iter().any(|h| h == &ja4_fp) && self.lockdown_enabled {
-                        lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja4");
+                    if self.blocked_ja4.iter().any(|h| h == &ja4_fp) {
+                        if self.lockdown_enabled {
+                            lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja4");
+                        }
+                        self.events.emit("quic-ja4", src, dst, sport, dport, &ja4_fp);
                     }
                 }
                 if let Some(name) = classify::parse_sni(&record) {
                     log::info!("  [quic-sni] {src}:{sport} -> {dst}:{dport}  server_name={name}");
-                    if self.blocked_sni.iter().any(|s| s == &name) && self.lockdown_enabled {
-                        lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "sni");
+                    if self.blocked_sni.iter().any(|s| s == &name) {
+                        if self.lockdown_enabled {
+                            lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "sni");
+                        }
+                        self.events.emit("quic-sni", src, dst, sport, dport, &name);
                     }
                 }
             }
@@ -892,6 +903,7 @@ impl Engine {
             if self.lockdown_enabled {
                 lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, &rule.name);
             }
+            self.events.emit("handshake", src, dst, sport, dport, &rule.name);
         }
         if self.trace {
             log::debug!("UDP  {src}:{sport} -> {dst}:{dport}  len={len}", len = payload.len());
@@ -953,6 +965,7 @@ fn block(
     stats: &BlockStats,
     blocked_ip: &mut Vec<(String, Option<Instant>)>,
     escalation: &mut HashMap<IpAddr, (u32, Instant)>,
+    events: &crate::events::EventLog,
     tcp: &TcpPacket,
     src: IpAddr,
     sport: u16,
@@ -966,6 +979,7 @@ fn block(
     if !fired {
         return;
     }
+    events.emit(kind, src, dst, sport, dport, detail);
     let now = Instant::now();
     let entry = escalation.entry(src).or_insert((0, now));
     if now.duration_since(entry.1) > ESCALATE_WINDOW {
@@ -1015,7 +1029,7 @@ mod tests {
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
-        ], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
+        ], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None)
         .unwrap();
         std::thread::sleep(Duration::from_millis(5)); // let the zero-TTL entry actually pass
         engine.prune_expired_ips();
@@ -1025,7 +1039,7 @@ mod tests {
 
     #[test]
     fn prune_idle_flows_drops_stale_entries() {
-        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
+        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None)
         .unwrap();
         let stale_key = ("10.0.0.1".parse().unwrap(), 1, "10.0.0.2".parse().unwrap(), 2);
         let fresh_key = ("10.0.0.3".parse().unwrap(), 3, "10.0.0.4".parse().unwrap(), 4);

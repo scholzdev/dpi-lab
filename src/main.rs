@@ -11,6 +11,9 @@
 // ASN database; config/asn.yml ships documented example ranges only.
 // --block-doh: escalate [doh] (known public DoH/DoT resolver IP match, see
 // config/doh_providers.yml) from log-only to an actual block.
+// --events-log <path>: append one JSON line per real block/lockdown event
+// to <path>, for dpi-lab-ui's live dashboard (see events.rs, src/bin/
+// dpi-lab-ui.rs). Off by default - no file, no writes.
 // --inject now also covers IPv6 flows (see inject::Ipv6RstSender) - Linux
 // only (needs IPV6_HDRINCL, absent from macOS's raw IPv6 socket API); on
 // other platforms IPv6 RST silently no-ops, same fallback shape as
@@ -65,6 +68,7 @@ mod cannon;
 mod classify;
 mod config;
 mod detect;
+mod events;
 mod fragment;
 mod engine;
 mod h2;
@@ -255,6 +259,10 @@ fn main() {
     // known public resolver (config/doh_providers.yml); --block-doh escalates
     // that to an actual block instead of log-only.
     let block_doh = args.iter().any(|a| a == "--block-doh");
+    // Structured JSONL for the web UI's live dashboard (src/bin/dpi-lab-ui.rs)
+    // - off by default, same opt-in shape as every other optional feature
+    // here. See events.rs for why this is a file, not an in-process channel.
+    let events_log_path = flag_values(&args, "--events-log").into_iter().next().map(std::path::PathBuf::from);
 
     let config_dir = Path::new("config");
     let mut block_sni = config::load_list(&config_dir.join("sni.yml"));
@@ -347,6 +355,7 @@ fn main() {
         block_doh,
         trace,
         block_stats,
+        events_log_path,
     )
     .expect("open raw socket for --inject/--redirect-dns (need root)");
 
