@@ -34,8 +34,17 @@ impl TimingStats {
         self.timestamps.push(Instant::now());
     }
 
-    /// Once enough samples are in, judge whether packet sizes and inter-arrival
-    /// gaps are both suspiciously uniform. Fires at most once per flow.
+    /// Once enough samples are in, judge whether this flow's packet sizes
+    /// and/or inter-arrival gaps are suspiciously uniform. Fires at most
+    /// once per flow, one of two independent signals off the same sample
+    /// window:
+    /// - both size AND timing uniform: `regular-packet-shape` (the original
+    ///   check - a VPN tunnel's fixed-interval keepalive/data pattern).
+    /// - size uniform alone, timing irregular: `uniform-packet-lengths` -
+    ///   fixed-size padding (a real technique several circumvention tools
+    ///   use, e.g. padding every record to a block size) with otherwise
+    ///   ordinary bursty timing wouldn't trip the combined check above, a
+    ///   real gap this closes rather than a simplification of it.
     pub fn check(&mut self) -> Option<&'static str> {
         if self.flagged || self.sizes.len() < MIN_SAMPLES {
             return None;
@@ -48,6 +57,8 @@ impl TimingStats {
 
         if size_cv < SIZE_CV_THRESHOLD && timing_cv < TIMING_CV_THRESHOLD {
             Some("regular-packet-shape (possible-vpn-tunnel)")
+        } else if size_cv < SIZE_CV_THRESHOLD {
+            Some("uniform-packet-lengths (possible-padding-evasion)")
         } else {
             None
         }
@@ -82,6 +93,21 @@ mod tests {
             sleep(Duration::from_millis(2)); // roughly identical gaps
         }
         assert_eq!(t.check(), Some("regular-packet-shape (possible-vpn-tunnel)"));
+    }
+
+    #[test]
+    fn uniform_sizes_alone_flag_padding_not_tunnel() {
+        // Identical size every packet (low size_cv) but genuinely irregular
+        // gaps (high timing_cv) - the combined tunnel check requires both,
+        // so this must trip the size-only signal instead.
+        let mut t = TimingStats::new();
+        let gaps_ms = [1u64, 40, 3, 90, 1, 60, 2, 120, 5, 80, 1, 55];
+        assert_eq!(gaps_ms.len(), MIN_SAMPLES);
+        for &g in &gaps_ms {
+            t.record(1200);
+            sleep(Duration::from_millis(g));
+        }
+        assert_eq!(t.check(), Some("uniform-packet-lengths (possible-padding-evasion)"));
     }
 
     #[test]
