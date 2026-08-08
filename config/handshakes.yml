@@ -64,3 +64,24 @@
   match:
     - offset: 0
       bytes: [0x53, 0x48, 0x53, 0x2D] # "SSH-"
+
+# Deliberately NOT added: Trojan, VMess, and Shadowsocks (any cipher mode,
+# including the old pre-AEAD "table"/RC4 ones). Investigated for this rule
+# format and rejected - none of them have a public fixed-length/byte-anchor
+# wire format to match, unlike WireGuard/IKEv2/OpenVPN above:
+#   - Trojan tunnels its request *inside a real TLS session* - by the time
+#     bytes are on the wire they're TLS application-data ciphertext,
+#     indistinguishable at this layer from any other TLS flow. Trojan is
+#     that indistinguishability - detecting it means fingerprinting the TLS
+#     layer itself (JA3, cert self-signed-ness), which this codebase already
+#     does elsewhere, not a handshakes.yml structural rule.
+#   - VMess's first bytes are AES-encrypted under a per-user key (UUID-
+#     derived) with a timestamp mixed in - no fixed byte pattern exists
+#     across users or connections to anchor on.
+#   - Shadowsocks (all modes) is ciphertext from byte 0 under an
+#     out-of-band pre-shared key/password; there is no plaintext header.
+# Shipping a rule here that doesn't actually match real traffic would be
+# worse than no rule (false confidence) - see example.md for what actually
+# catches these in practice (entropy heuristic, JA3, self-signed cert
+# detection), and REALITY/modern Xray goes further still, defeating even
+# those (see example.md's known limits).
