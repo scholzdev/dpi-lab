@@ -36,7 +36,10 @@ const HIGH_ENTROPY_THRESHOLD: f64 = 7.0;
 // look like TLS (obfs4 etc. commonly run on 443-ish ports to blend in) - cuts
 // false positives from protocols that never claimed to be TLS (SSH, arbitrary
 // binary protocols). Trade-off: real obfs4 on a non-443 port gets missed.
-pub const TLS_LIKE_PORTS: [u16; 2] = [443, 8443];
+// 853 = DNS-over-TLS (RFC 7858) - a real TLS ClientHello on this port, same
+// parser applies; most DoT clients send the resolver hostname as SNI in the
+// clear, so this one-line addition is enough to extract it (no new parsing).
+pub const TLS_LIKE_PORTS: [u16; 3] = [443, 8443, 853];
 
 /// Classify a connection's first observed payload segment on `port` (the flow's
 /// TCP port most likely to carry TLS - pass whichever of src/dst port is 443-like,

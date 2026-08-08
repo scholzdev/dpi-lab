@@ -1,0 +1,4 @@
+# Only meaningful with --allowlist-only: everything NOT matching one of these
+# IP/CIDR entries gets blocked, ignoring ip.yml/sni.yml/etc entirely. Empty by
+# default so --allowlist-only without populating this file blocks everything -
+# fail-closed, not fail-open.

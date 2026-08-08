@@ -34,6 +34,13 @@ const ESCALATED_IP_FILE: &str = "config/escalated_ip.yml"; // ip -> expiry, merg
 const LOCKDOWN_TTL: Duration = Duration::from_secs(3600);
 const LOCKDOWN_FILE: &str = "config/lockdown.yml";
 
+// Flow-table bounds: a lab tool has no business tracking flows forever. Idle
+// eviction handles the normal case (flow ended, no FIN/RST seen for whatever
+// reason); MAX_FLOWS is the backstop against deliberate flow-churn (many
+// short-lived connections opened just to grow these HashMaps unbounded).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_FLOWS: usize = 50_000;
+
 /// Crude but sufficient check for "this looks like the start of an HTTP request".
 fn looks_like_http_request(payload: &[u8]) -> bool {
     const METHODS: [&[u8]; 4] = [b"GET ", b"POST ", b"HEAD ", b"PUT "];
@@ -88,6 +95,12 @@ const KNOWN_JA3: &[(&str, &str)] = &[
 const SIG_SCAN_OVERLAP: usize = 64;
 // Give up waiting for the rest of a ClientHello after this many bytes.
 const CLIENTHELLO_CAP: usize = 4096;
+// A real ClientHello arrives in a small handful of segments even over a
+// constrained MTU path. Deliberately splitting it into many tiny segments is
+// a known middlebox-evasion trick (outlast a DPI box's reassembly limit) -
+// this many non-empty segments on a TLS-like port before the ClientHello
+// resolves is itself a signal, independent of what's eventually in it.
+const FRAGMENTATION_SEGMENT_THRESHOLD: u32 = 8;
 
 struct FlowState {
     stream: TcpStream,
@@ -100,11 +113,15 @@ struct FlowState {
     cannon_fired: bool,
     handshake_checked: bool, // TCP-side structural handshake match (e.g. SSH banner), once per flow
     host_checked: bool, // plaintext HTTP Host: header, once per flow - see classify::parse_http_host
+    last_seen: Instant, // for idle eviction, see prune_idle_flows
+    tls_segment_count: u32, // non-empty segments seen on a TLS-like port before ClientHello resolved
+    fragmentation_flagged: bool, // single-shot, like checked_entropy - don't spam the log
 }
 
 pub struct Engine {
     streams: HashMap<FlowKey, FlowState>,
-    udp_timing: HashMap<FlowKey, TimingStats>,
+    udp_timing: HashMap<FlowKey, (TimingStats, Instant)>, // stats + last-seen, for idle eviction
+    udp_allowlist_logged: std::collections::HashSet<FlowKey>, // one-shot gate, see allowlist_only check in handle_udp
     sigs: Signatures,
     handshake_rules: Vec<classify::HandshakeRule>, // known protocol handshake signatures, see config/handshakes.yml
     injector: Option<TransportSender>,
@@ -114,6 +131,8 @@ pub struct Engine {
     blocked_sni: Vec<String>,
     blocked_ja3: Vec<String>,
     blocked_ip: Vec<(String, Option<Instant>)>, // (ip, expiry) - None = permanent, Some = auto-escalated
+    allowlist: Vec<String>, // IP/CIDR allow-list, only meaningful when allowlist_only is set
+    allowlist_only: bool, // default-deny: block everything NOT on `allowlist`, ignoring blocked_ip entirely
     probe_targets: Vec<String>, // allow-list for active probing, see probe.rs
     cannon: CannonConfig, // response-injection allow-list + payload, see cannon.rs
     cannon_enabled: bool,
@@ -135,6 +154,8 @@ impl Engine {
         blocked_sni: Vec<String>,
         blocked_ja3: Vec<String>,
         blocked_ip: Vec<(String, Option<Duration>)>, // (ip, remaining TTL); None = permanent
+        allowlist: Vec<String>,
+        allowlist_only: bool,
         signatures: Vec<String>,
         handshake_rules: Vec<classify::HandshakeRule>,
         redirect_map: Vec<(String, String)>,
@@ -211,12 +232,16 @@ impl Engine {
         if block_quic {
             println!("[block-quic] blanket-dropping UDP:443 - QUIC forced to fall back to TCP+TLS");
         }
+        if allowlist_only {
+            println!("[allowlist-only] default-deny mode: {} entries, everything else blocked", allowlist.len());
+        }
         let now = Instant::now();
         let blocked_ip = blocked_ip.into_iter().map(|(ip, ttl)| (ip, ttl.map(|d| now + d))).collect();
         let lockdown_ips = lockdown_ips.into_iter().map(|(ip, d)| (ip, now + d)).collect();
         Ok(Self {
             streams: HashMap::new(),
             udp_timing: HashMap::new(),
+            udp_allowlist_logged: std::collections::HashSet::new(),
             sigs: Signatures::new(&signatures),
             handshake_rules,
             injector,
@@ -226,6 +251,8 @@ impl Engine {
             blocked_sni,
             blocked_ja3,
             blocked_ip,
+            allowlist,
+            allowlist_only,
             probe_targets,
             cannon,
             cannon_enabled,
@@ -301,13 +328,34 @@ impl Engine {
         }
     }
 
+    /// Drop flows with no activity in IDLE_TIMEOUT. A lab tool has no
+    /// business tracking a flow forever just because neither side sent a
+    /// clean FIN/RST we happened to observe.
+    fn prune_idle_flows(&mut self) {
+        let now = Instant::now();
+        self.streams.retain(|_, s| now.duration_since(s.last_seen) < IDLE_TIMEOUT);
+        self.udp_timing.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < IDLE_TIMEOUT);
+        let live: &HashMap<_, _> = &self.udp_timing;
+        self.udp_allowlist_logged.retain(|k| live.contains_key(k));
+    }
+
     fn handle_tcp(&mut self, src: IpAddr, dst: IpAddr, tcp: &TcpPacket) {
         self.prune_expired_ips(); // must run before `state` borrow below
         self.prune_expired_lockdowns();
+        self.prune_idle_flows();
         let (sport, dport) = (tcp.get_source(), tcp.get_destination());
         let key = (src, sport, dst, dport);
         let syn = tcp.get_flags() & TcpFlags::SYN != 0;
         let payload = tcp.payload();
+
+        // Backstop against flow-churn (many short-lived connections opened
+        // just to grow this HashMap unbounded) - idle eviction above handles
+        // the normal case, this is the hard cap for a genuinely new key.
+        if !self.streams.contains_key(&key) && self.streams.len() >= MAX_FLOWS {
+            if let Some(oldest) = self.streams.iter().min_by_key(|(_, s)| s.last_seen).map(|(k, _)| *k) {
+                self.streams.remove(&oldest);
+            }
+        }
 
         // Cannon-eligibility check needs a second self.streams lookup (the
         // reverse flow's ISN), which can't happen once `state` below borrows
@@ -337,8 +385,12 @@ impl Engine {
                 cannon_fired: false,
                 handshake_checked: false,
                 host_checked: false,
+                last_seen: Instant::now(),
+                tls_segment_count: 0,
+                fragmentation_flagged: false,
             }
         });
+        state.last_seen = Instant::now();
 
         if let Some(server_seq) = cannon_server_seq {
             if !state.cannon_fired {
@@ -363,6 +415,26 @@ impl Engine {
             state.timing.record(payload.len());
         }
 
+        // Deliberate over-fragmentation of the ClientHello (many tiny
+        // segments) is itself a middlebox-evasion signal - check before the
+        // ClientHello retry logic below so it can fire even if the hello
+        // never resolves within CLIENTHELLO_CAP.
+        if !payload.is_empty() && !state.checked_entropy && !state.fragmentation_flagged
+            && (TLS_LIKE_PORTS.contains(&dport) || TLS_LIKE_PORTS.contains(&sport))
+        {
+            state.tls_segment_count += 1;
+            if state.tls_segment_count > FRAGMENTATION_SEGMENT_THRESHOLD {
+                state.fragmentation_flagged = true;
+                println!("  [detect] possible-fragmentation-evasion on {src}:{sport} -> {dst}:{dport}");
+                if self.lockdown_enabled {
+                    lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "possible-fragmentation-evasion");
+                }
+                if self.inject_on_detect {
+                    block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "detect", "possible-fragmentation-evasion");
+                }
+            }
+        }
+
         // IP block needs no payload inspection, so check once per flow, first.
         if !state.ip_checked {
             state.ip_checked = true;
@@ -371,6 +443,16 @@ impl Engine {
                 block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ip", "");
                 if self.lockdown_enabled {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "ip");
+                }
+            } else if self.allowlist_only && !self.allowlist.iter().any(|rule| ip_rule_matches(rule, &src) || ip_rule_matches(rule, &dst)) {
+                // Default-deny mode: neither side of this flow is on the
+                // allowlist, so it's blocked regardless of the (irrelevant
+                // in this mode) blocked_ip list. IP/CIDR only for now - SNI
+                // isn't known yet at this point in the flow.
+                println!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport} (not on allowlist)");
+                block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "allowlist", "");
+                if self.lockdown_enabled {
+                    lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "allowlist");
                 }
             }
         }
@@ -523,16 +605,30 @@ impl Engine {
     }
 
     fn handle_udp(&mut self, src: IpAddr, dst: IpAddr, udp: &UdpPacket) {
+        self.prune_idle_flows();
         let (sport, dport) = (udp.get_source(), udp.get_destination());
         let payload = udp.payload();
 
         let key = (src, sport, dst, dport);
-        let timing = self.udp_timing.entry(key).or_insert_with(TimingStats::new);
+        let (timing, last_seen) = self.udp_timing.entry(key).or_insert_with(|| (TimingStats::new(), Instant::now()));
+        *last_seen = Instant::now();
         if !payload.is_empty() {
             timing.record(payload.len());
         }
         if let Some(label) = timing.check() {
             println!("  [timing] {label} on {src}:{sport} -> {dst}:{dport}");
+        }
+
+        // Default-deny mode, UDP side: no RST-equivalent for UDP (see the
+        // handshake-rule branch below), so this is lockdown-only, and only
+        // fires once per flow (a println! per packet would flood the log).
+        if self.allowlist_only && !self.allowlist.iter().any(|rule| ip_rule_matches(rule, &src) || ip_rule_matches(rule, &dst)) {
+            if self.udp_allowlist_logged.insert(key) {
+                println!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport} (not on allowlist)");
+            }
+            if self.lockdown_enabled {
+                lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "allowlist");
+            }
         }
 
         // dport==53: this is a client's outbound query to a resolver at `dst`.
@@ -559,6 +655,14 @@ impl Engine {
         } else if sport == 53 {
             if let Some(name) = parse_dns_query_full(payload).map(|q| q.name) {
                 println!("  [dns] {src}:{sport} -> {dst}:{dport}  query={name}");
+            }
+        } else if dport == 5353 || sport == 5353 {
+            // mDNS (RFC 6762) - same wire format as unicast DNS, reuse the
+            // parser as-is. Multicast, so there's no single resolver to spoof
+            // an answer to the way --redirect-dns does for unicast :53 -
+            // detection/log only.
+            if let Some(query) = parse_dns_query_full(payload) {
+                println!("  [mdns] {src}:{sport} -> {dst}:{dport}  query={}", query.name);
             }
         } else if dport == 443 || sport == 443 {
             // QUIC Initial packets are decryptable without keys - RFC 9001 §5.2
@@ -709,12 +813,57 @@ mod tests {
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
-        ], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
+        ], vec![], false, vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
         .unwrap();
         std::thread::sleep(Duration::from_millis(5)); // let the zero-TTL entry actually pass
         engine.prune_expired_ips();
         let remaining: Vec<&str> = engine.blocked_ip.iter().map(|(ip, _)| ip.as_str()).collect();
         assert_eq!(remaining, vec!["still-blocked", "permanent"]);
+    }
+
+    #[test]
+    fn prune_idle_flows_drops_stale_entries() {
+        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
+        .unwrap();
+        let stale_key = ("10.0.0.1".parse().unwrap(), 1, "10.0.0.2".parse().unwrap(), 2);
+        let fresh_key = ("10.0.0.3".parse().unwrap(), 3, "10.0.0.4".parse().unwrap(), 4);
+        let mut stale = FlowState {
+            stream: TcpStream::new(0),
+            sni: None,
+            checked_entropy: false,
+            saw_syn: false,
+            sig_scanned_len: 0,
+            timing: TimingStats::new(),
+            ip_checked: false,
+            cannon_fired: false,
+            handshake_checked: false,
+            host_checked: false,
+            last_seen: Instant::now(),
+            tls_segment_count: 0,
+            fragmentation_flagged: false,
+        };
+        stale.last_seen -= IDLE_TIMEOUT + Duration::from_secs(1);
+        let mut fresh = FlowState {
+            stream: TcpStream::new(0),
+            sni: None,
+            checked_entropy: false,
+            saw_syn: false,
+            sig_scanned_len: 0,
+            timing: TimingStats::new(),
+            ip_checked: false,
+            cannon_fired: false,
+            handshake_checked: false,
+            host_checked: false,
+            last_seen: Instant::now(),
+            tls_segment_count: 0,
+            fragmentation_flagged: false,
+        };
+        fresh.last_seen = Instant::now();
+        engine.streams.insert(stale_key, stale);
+        engine.streams.insert(fresh_key, fresh);
+        engine.prune_idle_flows();
+        assert!(!engine.streams.contains_key(&stale_key));
+        assert!(engine.streams.contains_key(&fresh_key));
     }
 
     #[test]

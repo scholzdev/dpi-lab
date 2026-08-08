@@ -1,7 +1,10 @@
 // Live capture -> engine pipeline (decode/reassemble/classify/inject/redirect).
 // Run: sudo ./target/debug/dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns] [--trace]
 //      [--block-sni <domain>]... [--block-ja3 <hash>]... [--block-ip <ip>]... [--block-sig <keyword>]...
-//      [--lockdown] [--block-ech] [--block-quic]
+//      [--lockdown] [--block-ech] [--block-quic] [--allowlist-only]
+// --allowlist-only: default-deny mode - block every flow whose src/dst isn't
+// in config/allowlist.yml (IP/CIDR), ignoring block_ip/sni/ja3/etc entirely.
+// Empty allowlist.yml + this flag blocks everything (fail-closed).
 // --trace prints every raw TCP/UDP packet (flood); without it, only
 // classification/block events ([sni] [ja3] [host] [ech] [quic-sni] [quic-ja3]
 // [detect] [dns] [inject] [timing] [ip]) print. --block-ech requires --lockdown
@@ -172,6 +175,11 @@ fn main() {
     // Rather than let that opacity through, force a downgrade: drop all UDP:443
     // so browsers fall back to TCP+TLS, where SNI/JA3 blocking already works.
     let block_quic = args.iter().any(|a| a == "--block-quic");
+    // Default-deny: block every flow whose src/dst isn't on config/allowlist.yml,
+    // ignoring the blocklists entirely. IP/CIDR only (see engine.rs's allowlist
+    // check) - the severe GFW mode used during high-alert periods, as opposed
+    // to the normal "block a known list" mode everything else here implements.
+    let allowlist_only = args.iter().any(|a| a == "--allowlist-only");
 
     let config_dir = Path::new("config");
     let mut block_sni = config::load_list(&config_dir.join("sni.yml"));
@@ -199,6 +207,8 @@ fn main() {
     // get an outbound probe connection on a [detect] hit. Empty by default.
     let probe_targets = config::load_list(&config_dir.join("probe_targets.yml"));
     let cannon = config::load_cannon_config(&config_dir.join("cannon.yml"));
+    // Only meaningful with --allowlist-only; empty otherwise (nothing to check against).
+    let allowlist = config::load_list(&config_dir.join("allowlist.yml"));
     // Same ip -> number shape as the escalated-block expiry map, just reused
     // here for kbit/s instead of a unix timestamp.
     let throttle_entries: Vec<(String, u32)> =
@@ -233,6 +243,8 @@ fn main() {
         block_sni,
         block_ja3,
         block_ip,
+        allowlist,
+        allowlist_only,
         signatures,
         handshake_rules,
         redirect_map,
