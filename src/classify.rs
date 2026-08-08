@@ -17,9 +17,16 @@ impl Signatures {
 
     /// Returns the names of every pattern found in `payload`.
     pub fn matches(&self, payload: &[u8]) -> Vec<&str> {
+        self.find_matches(payload).into_iter().map(|(_, _, name)| name).collect()
+    }
+
+    /// Same as `matches`, but also returns each hit's byte span in
+    /// `payload` - mitm.rs's response-body redaction needs the position,
+    /// not just the pattern name, to blank out exactly the matched bytes.
+    pub fn find_matches(&self, payload: &[u8]) -> Vec<(usize, usize, &str)> {
         self.ac
             .find_iter(payload)
-            .map(|m| self.patterns[m.pattern()].as_str())
+            .map(|m| (m.start(), m.end(), self.patterns[m.pattern()].as_str()))
             .collect()
     }
 }
@@ -597,6 +604,33 @@ pub fn parse_http_request_line(data: &[u8]) -> Option<(String, String)> {
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     Some((path.to_string(), percent_decode(query)))
+}
+
+/// Parse a plaintext HTTP/1.1 response's status line + headers - used by
+/// mitm.rs to figure out how to read the body that follows (Content-Length
+/// vs Transfer-Encoding: chunked vs connection-close-delimited) before
+/// scanning/redacting it. Returns `(status_code, headers, header_block_len)`
+/// where `header_block_len` is how many bytes of `data` the status line +
+/// headers + terminating blank line took up - the body starts right after.
+/// `None` if the terminating `\r\n\r\n` hasn't arrived yet (same
+/// "try, return None" shape as everything else here - caller decides
+/// whether to keep reading or give up).
+pub fn parse_http_response_head(data: &[u8]) -> Option<(u16, Vec<(String, String)>, usize)> {
+    let text = std::str::from_utf8(data).ok()?;
+    let head_end = text.find("\r\n\r\n")? + 4;
+    let mut lines = text[..head_end].split("\r\n");
+    let status_line = lines.next()?;
+    let mut parts = status_line.split(' ');
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    let status_code: u16 = parts.next()?.parse().ok()?;
+    let headers = lines
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+        .collect();
+    Some((status_code, headers, head_end))
 }
 
 /// `application/x-www-form-urlencoded`-style decoding (RFC 3986 §2.1 plus
@@ -1237,5 +1271,32 @@ mod tests {
     fn request_line_missing_or_malformed_is_none() {
         assert!(parse_http_request_line(b"not an http request at all").is_none());
         assert!(parse_http_request_line(b"").is_none());
+    }
+
+    #[test]
+    fn response_head_parses_status_and_headers() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 42\r\n\r\nbody starts here";
+        let (status, headers, head_len) = parse_http_response_head(raw).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(headers, vec![("Content-Type".to_string(), "text/html".to_string()), ("Content-Length".to_string(), "42".to_string())]);
+        assert_eq!(&raw[head_len..], b"body starts here");
+    }
+
+    #[test]
+    fn response_head_incomplete_is_none() {
+        assert!(parse_http_response_head(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n").is_none()); // no terminating blank line yet
+    }
+
+    #[test]
+    fn response_head_rejects_non_http() {
+        assert!(parse_http_response_head(b"not a response\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn signatures_find_matches_reports_byte_spans() {
+        let sigs = Signatures::new(&["blocked"]);
+        let hits = sigs.find_matches(b"this is blocked content");
+        assert_eq!(hits, vec![(8, 15, "blocked")]);
+        assert_eq!(&b"this is blocked content"[8..15], b"blocked");
     }
 }
