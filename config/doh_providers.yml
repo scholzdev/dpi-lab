@@ -1,0 +1,11 @@
+# --block-doh (or plain [doh] logging, on by default whenever a ClientHello's
+# dst IP matches an entry here) - a handful of well-known public DoH/DoT
+# resolver IPs. Heuristic and IP-based only: this is "well-known resolver
+# address", not general DNS-over-HTTPS traffic detection (that's a much
+# harder traffic-analysis problem, out of scope - see example.md).
+1.1.1.1: "Cloudflare DNS"
+1.0.0.1: "Cloudflare DNS"
+8.8.8.8: "Google Public DNS"
+8.8.4.4: "Google Public DNS"
+9.9.9.9: "Quad9"
+149.112.112.112: "Quad9"

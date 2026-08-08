@@ -151,6 +151,8 @@ pub struct Engine {
     lockdown_enabled: bool,
     block_ech: bool,  // block on encrypted_client_hello presence alone - can't read SNI to filter by name
     block_quic: bool, // force QUIC->TCP downgrade: blanket-drop UDP:443, see lockdown::build_ruleset
+    doh_providers: Vec<(String, String)>, // ip_or_cidr -> name, see config/doh_providers.yml
+    block_doh: bool, // off by default: [doh] just logs unless this is set
     trace: bool, // print every raw packet, not just classification/block events
     block_stats: BlockStats,
     escalation: HashMap<IpAddr, (u32, Instant)>, // offense count + window start, per source IP
@@ -179,6 +181,8 @@ impl Engine {
         lockdown_enabled: bool,
         block_ech: bool,
         block_quic: bool,
+        doh_providers: Vec<(String, String)>,
+        block_doh: bool,
         trace: bool,
         block_stats: BlockStats,
     ) -> std::io::Result<Self> {
@@ -251,6 +255,9 @@ impl Engine {
         for asn in &blocked_asn {
             println!("[block-asn] AS{asn} ({} ranges loaded)", asn_ranges.len());
         }
+        if block_doh {
+            println!("[block-doh] blocking on known DoH/DoT resolver IP match ({} providers loaded)", doh_providers.len());
+        }
         let now = Instant::now();
         let blocked_ip = blocked_ip.into_iter().map(|(ip, ttl)| (ip, ttl.map(|d| now + d))).collect();
         let lockdown_ips = lockdown_ips.into_iter().map(|(ip, d)| (ip, now + d)).collect();
@@ -278,6 +285,8 @@ impl Engine {
             lockdown_enabled,
             block_ech,
             block_quic,
+            doh_providers,
+            block_doh,
             trace,
             block_stats,
             escalation: HashMap::new(),
@@ -541,6 +550,15 @@ impl Engine {
                         block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja3", &hash);
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja3");
+                        }
+                    }
+                }
+                if let Some((_, name)) = self.doh_providers.iter().find(|(rule, _)| ip_rule_matches(rule, &dst)) {
+                    println!("  [doh] {src}:{sport} -> {dst}:{dport}  known DoH/DoT resolver ({name})");
+                    if self.block_doh {
+                        block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "doh", name);
+                        if self.lockdown_enabled {
+                            lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "doh");
                         }
                     }
                 }
@@ -866,7 +884,7 @@ mod tests {
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
-        ], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
+        ], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
         .unwrap();
         std::thread::sleep(Duration::from_millis(5)); // let the zero-TTL entry actually pass
         engine.prune_expired_ips();
@@ -876,7 +894,7 @@ mod tests {
 
     #[test]
     fn prune_idle_flows_drops_stale_entries() {
-        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
+        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
         .unwrap();
         let stale_key = ("10.0.0.1".parse().unwrap(), 1, "10.0.0.2".parse().unwrap(), 2);
         let fresh_key = ("10.0.0.3".parse().unwrap(), 3, "10.0.0.4".parse().unwrap(), 4);

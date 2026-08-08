@@ -1,13 +1,15 @@
 // Live capture -> engine pipeline (decode/reassemble/classify/inject/redirect).
 // Run: sudo ./target/debug/dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns] [--trace]
 //      [--block-sni <domain>]... [--block-ja3 <hash>]... [--block-ip <ip>]... [--block-sig <keyword>]...
-//      [--lockdown] [--block-ech] [--block-quic] [--allowlist-only] [--block-asn <num>]...
+//      [--lockdown] [--block-ech] [--block-quic] [--allowlist-only] [--block-asn <num>]... [--block-doh]
 // --allowlist-only: default-deny mode - block every flow whose src/dst isn't
 // in config/allowlist.yml (IP/CIDR), ignoring block_ip/sni/ja3/etc entirely.
 // Empty allowlist.yml + this flag blocks everything (fail-closed).
 // --block-asn: block every flow whose src/dst IP resolves (via config/asn.yml's
 // {cidr, asn, name} ranges - see asn.rs) to one of the given ASNs. No bundled
 // ASN database; config/asn.yml ships documented example ranges only.
+// --block-doh: escalate [doh] (known public DoH/DoT resolver IP match, see
+// config/doh_providers.yml) from log-only to an actual block.
 // --trace prints every raw TCP/UDP packet (flood); without it, only
 // classification/block events ([sni] [ja3] [host] [ech] [quic-sni] [quic-ja3]
 // [detect] [dns] [inject] [timing] [ip]) print. --block-ech requires --lockdown
@@ -184,6 +186,10 @@ fn main() {
     // check) - the severe GFW mode used during high-alert periods, as opposed
     // to the normal "block a known list" mode everything else here implements.
     let allowlist_only = args.iter().any(|a| a == "--allowlist-only");
+    // DoH heuristic: [doh] logs whenever a ClientHello's dst IP matches a
+    // known public resolver (config/doh_providers.yml); --block-doh escalates
+    // that to an actual block instead of log-only.
+    let block_doh = args.iter().any(|a| a == "--block-doh");
 
     let config_dir = Path::new("config");
     let mut block_sni = config::load_list(&config_dir.join("sni.yml"));
@@ -217,6 +223,7 @@ fn main() {
     // config/asn.yml's {cidr, asn, name} ranges - see asn.rs.
     let asn_ranges = config::load_asn_ranges(&config_dir.join("asn.yml"));
     let blocked_asn: Vec<u32> = flag_values(&args, "--block-asn").into_iter().filter_map(|s| s.parse().ok()).collect();
+    let doh_providers = config::load_map(&config_dir.join("doh_providers.yml"));
     // Same ip -> number shape as the escalated-block expiry map, just reused
     // here for kbit/s instead of a unix timestamp.
     let throttle_entries: Vec<(String, u32)> =
@@ -265,6 +272,8 @@ fn main() {
         lockdown_enabled,
         block_ech,
         block_quic,
+        doh_providers,
+        block_doh,
         trace,
         block_stats,
     )

@@ -243,6 +243,15 @@ mod tests {
         assert_eq!(ranges[0].asn, 64500);
     }
 
+    /// Regression guard on the shipped file - same reasoning as
+    /// real_asn_yml_parses.
+    #[test]
+    fn real_doh_providers_yml_parses() {
+        let providers = load_map(Path::new("config/doh_providers.yml"));
+        assert_eq!(providers.len(), 6);
+        assert!(providers.iter().any(|(ip, name)| ip == "1.1.1.1" && name == "Cloudflare DNS"));
+    }
+
     /// Regression guard on the actual shipped file, not a synthetic fixture -
     /// catches a broken config/handshakes.yml (bad YAML, wrong rule count)
     /// before it ships silently as "zero rules loaded, no error printed."
