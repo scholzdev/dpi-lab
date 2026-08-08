@@ -52,7 +52,7 @@ services:
       - "traefik.enable=true"
       - "traefik.docker.network=internal"
       - "traefik.http.services.dpi-lab-ui.loadbalancer.server.port=8080"
-      - "traefik.http.routers.dpi-lab-ui.rule=Host(`dpi.florianscholz.me`)"
+      - "traefik.http.routers.dpi-lab-ui.rule=Host(`dpi.hb.florianscholz.me`)"
       # TODO: confirm this matches the entrypoint name in your
       # traefik/config/traefik.yml static config (commonly "websecure").
       - "traefik.http.routers.dpi-lab-ui.entrypoints=websecure"
