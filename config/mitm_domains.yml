@@ -1,0 +1,6 @@
+# SNIs to actually TLS-intercept via --mitm - explicit allow-list, own lab
+# only (same framing as probe_targets.yml/cannon.yml). Anything not listed
+# here gets blind-relayed untouched, no TLS termination, no cert involved.
+# Empty by default - nothing intercepted until you add a domain.
+#- google.com
+#- www.google.com

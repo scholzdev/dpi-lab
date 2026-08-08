@@ -62,6 +62,23 @@
 // enforcement instead of passive capture + off-path racing, see src/inline.rs.
 // Run as: sudo ./target/debug/dpi-lab --inline (no interface arg - nftables
 // picks up FORWARD traffic directly, this machine must be the actual gateway).
+// --mitm (Mac + Linux, see src/mitm.rs) is HTTPS keyword censorship: a
+// transparent TLS-intercepting proxy (Linux TPROXY / macOS pf rdr-to) that
+// terminates TLS with a locally-signed leaf cert, decrypts, scans the
+// request (HTTP/1.1 or h2) with config/signatures.yml's same keyword list,
+// re-encrypts to the real origin. A request match kills the connection
+// ([mitm-keyword]); a response-body match instead redacts just the
+// matched bytes in place and forwards the rest ([mitm-redact], HTTP/1.1
+// only). Only for domains explicitly listed in config/mitm_domains.yml -
+// everything else is blind-relayed untouched.
+// Needs --mitm-iface <name>, a CA cert+key (--mitm-ca-cert/--mitm-ca-key,
+// default config/mitm_ca.{crt,key}), and this machine to actually be the
+// network gateway (IP forwarding enabled). CA private key is a real
+// secret - see mitm.rs's header comment. Also blanket-drops UDP:443
+// (lockdown's --block-quic mechanism) by default - QUIC is UDP, our
+// tproxy/rdr rules only match TCP, so an un-refused QUIC connection would
+// bypass --mitm entirely and talk straight to the real origin. Opt out
+// with --no-block-quic if that's not acceptable for your setup.
 // --inline --downgrade-tls13: forces TLS 1.3 ClientHellos to 1.2 in place
 // (flips the supported_versions extension's 0x0304 entries to 0x0303, never
 // changes packet length - see classify::mangle_supported_versions_in_place).
@@ -70,26 +87,9 @@
 // this and abort - real-world effect is confined to non-conformant/legacy
 // TLS stacks, see example.md.
 // (no arg = list interfaces)
-mod asn;
-mod cannon;
-mod classify;
-mod config;
-mod detect;
-mod events;
-mod fragment;
-mod engine;
-mod h2;
-mod inject;
-mod inline;
-mod ipv6ext;
-mod lockdown;
-mod probe;
-mod quic;
-mod reassembly;
-mod redirect;
-mod throttle;
-mod timing;
-
+use dpi_lab::{classify, config, engine, lockdown, probe, throttle};
+#[cfg(target_os = "linux")]
+use dpi_lab::inline;
 use engine::{BlockStats, Engine};
 use pnet::datalink::{self, Channel::Ethernet};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
@@ -200,6 +200,71 @@ fn run_scan(cidr: &str, args: &[String]) {
     }
 }
 
+// Transparent TLS-intercepting MITM (see mitm.rs) - standalone mode, own
+// top-level flag like --scan, independent of --inline/NFQUEUE (TPROXY on
+// Linux / pf rdr-to on macOS is its own interception mechanism). Requires
+// this machine to actually be the network gateway (IP forwarding enabled,
+// other devices routed through it).
+const DEFAULT_MITM_PORT: u16 = 8443;
+
+fn run_mitm(args: &[String]) {
+    let iface = match flag_values(args, "--mitm-iface").into_iter().next() {
+        Some(i) => i,
+        None => {
+            log::error!("--mitm needs --mitm-iface <name> (the WAN/forward-facing interface)");
+            std::process::exit(1);
+        }
+    };
+    let config_dir = Path::new("config");
+    let ca_cert_path = flag_values(args, "--mitm-ca-cert").into_iter().next().map(std::path::PathBuf::from).unwrap_or_else(|| config_dir.join("mitm_ca.crt"));
+    let ca_key_path = flag_values(args, "--mitm-ca-key").into_iter().next().map(std::path::PathBuf::from).unwrap_or_else(|| config_dir.join("mitm_ca.key"));
+    let listen_port = flag_values(args, "--mitm-port").into_iter().next().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_MITM_PORT);
+    let intercept_domains = config::load_list(&config_dir.join("mitm_domains.yml"));
+    // Same keyword list config/signatures.yml already feeds the
+    // plaintext-HTTP [url-keyword] path - one list, two enforcement points.
+    let signatures = config::load_list(&config_dir.join("signatures.yml"));
+
+    // QUIC bypasses --mitm entirely: it's UDP, our tproxy/rdr rules only
+    // match TCP:443, and even if they didn't, QUIC's own TLS 1.3 handshake
+    // would need a whole separate QUIC-terminating proxy to MITM (nothing
+    // like that exists here). Blanket-drop UDP:443 by default instead, so
+    // a client that would've silently gone straight to the real origin
+    // over QUIC falls back to TCP+TLS, which --mitm *can* see. Same
+    // lockdown::block_quic mechanism --block-quic already uses elsewhere -
+    // opt out with --no-block-quic if you specifically need QUIC to work.
+    let block_quic = !args.iter().any(|a| a == "--no-block-quic");
+    if block_quic {
+        if let Err(e) = lockdown::ensure_hooked() {
+            log::error!("[mitm] failed to hook lockdown anchor for --block-quic: {e}");
+        }
+        if let Err(e) = lockdown::apply_all(&[], true) {
+            log::error!("[mitm] failed to apply UDP:443 blanket drop: {e}");
+        }
+    }
+
+    ctrlc::set_handler(move || {
+        if block_quic {
+            lockdown::clear_all();
+        }
+        dpi_lab::mitm::teardown();
+    })
+    .expect("failed to set Ctrl-C handler");
+
+    let cfg = dpi_lab::mitm::MitmConfig {
+        intercept_domains,
+        sigs: classify::Signatures::new(&signatures),
+        ca_cert_path,
+        ca_key_path,
+        listen_port,
+        iface,
+    };
+    if let Err(e) = dpi_lab::mitm::run(cfg) {
+        log::error!("[mitm] fatal: {e} (needs root + nft/pfctl on PATH, and a CA cert+key at the given paths)");
+        dpi_lab::mitm::teardown();
+        std::process::exit(1);
+    }
+}
+
 /// Collect every value following a repeatable `--flag value` pair, e.g.
 /// `--block-sni a.com --block-sni b.com` -> `["a.com", "b.com"]`.
 fn flag_values(args: &[String], flag: &str) -> Vec<String> {
@@ -224,11 +289,14 @@ fn main() {
     if let Some(cidr) = flag_values(&args, "--scan").into_iter().next() {
         return run_scan(&cidr, &args);
     }
+    if args.iter().any(|a| a == "--mitm") {
+        return run_mitm(&args);
+    }
 
     let iface_name = match args.get(1) {
         Some(n) => n.clone(),
         None => {
-            println!("usage: dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns]\n   or: dpi-lab --inline (Linux only, genuine in-path NFQUEUE mode - see writeup.md)\n   or: dpi-lab --scan <cidr> [--scan-ports <p>]...\navailable interfaces:");
+            println!("usage: dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns]\n   or: dpi-lab --inline (Linux only, genuine in-path NFQUEUE mode - see writeup.md)\n   or: dpi-lab --scan <cidr> [--scan-ports <p>]...\n   or: dpi-lab --mitm --mitm-iface <name> [--mitm-port <p>] [--mitm-ca-cert <path>] [--mitm-ca-key <path>] [--no-block-quic] (Mac + Linux TLS-intercepting keyword censorship, see mitm.rs)\navailable interfaces:");
             for i in datalink::interfaces() {
                 println!("  {}", i.name);
             }

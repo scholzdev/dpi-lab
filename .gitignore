@@ -6,3 +6,6 @@ example.md
 # runtime-generated: --events-log output, docker-compose's shared data volume
 events.jsonl
 /data
+
+# --mitm CA private key - mints trusted certs for any hostname, never commit
+config/mitm_ca.key

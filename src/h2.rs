@@ -24,6 +24,22 @@ const FLAG_PRIORITY: u8 = 0x20;
 /// of an HTTP/2 client connection. `data` is the reassembled stream from the
 /// connection's start - only fires if it begins with the HTTP/2 preface.
 pub fn extract_authority(data: &[u8]) -> Option<String> {
+    header_value(&first_headers_block(data)?, b":authority")
+}
+
+/// Extract the `:path` pseudo-header value (the full request-target,
+/// including any query string - HTTP/2 has no separate "Host:"/request-line
+/// split the way HTTP/1.1 does) from the first HEADERS frame. Used by
+/// mitm.rs to scan HTTP/2 requests for blocked keywords the same way
+/// classify::parse_http_request_line's query does for HTTP/1.1.
+pub fn extract_path(data: &[u8]) -> Option<String> {
+    header_value(&first_headers_block(data)?, b":path")
+}
+
+/// Walk frames from the connection preface to the first HEADERS frame and
+/// return its (pad/priority-stripped) header block, ready for HPACK decode.
+/// Shared by every pseudo-header extractor above.
+fn first_headers_block(data: &[u8]) -> Option<Vec<u8>> {
     if !data.starts_with(PREFACE) {
         return None;
     }
@@ -41,7 +57,7 @@ pub fn extract_authority(data: &[u8]) -> Option<String> {
             if flags & FLAG_END_HEADERS == 0 {
                 return None; // header block continues in a CONTINUATION frame - not chased
             }
-            return authority_from_header_block(strip_headers_framing(payload, flags)?);
+            return Some(strip_headers_framing(payload, flags)?.to_vec());
         }
         offset = payload_start + len;
     }
@@ -65,11 +81,11 @@ fn strip_headers_framing(payload: &[u8], flags: u8) -> Option<&[u8]> {
     payload.get(p..payload.len().checked_sub(pad_len)?)
 }
 
-fn authority_from_header_block(block: &[u8]) -> Option<String> {
+fn header_value(block: &[u8], name: &[u8]) -> Option<String> {
     let headers = Decoder::new().decode(block).ok()?;
     headers
         .into_iter()
-        .find(|(name, _)| name == b":authority")
+        .find(|(n, _)| n == name)
         .map(|(_, value)| String::from_utf8_lossy(&value).into_owned())
 }
 
@@ -95,6 +111,27 @@ mod tests {
             (&b":method"[..], b"GET".as_slice()),
             (&b":authority"[..], authority.as_bytes()),
         ])
+    }
+
+    fn headers_block_with_path(path: &str) -> Vec<u8> {
+        hpack::Encoder::new().encode(vec![
+            (&b":method"[..], b"GET".as_slice()),
+            (&b":path"[..], path.as_bytes()),
+        ])
+    }
+
+    #[test]
+    fn extracts_path_from_first_headers_frame() {
+        let mut data = PREFACE.to_vec();
+        data.extend(frame(HEADERS_FRAME_TYPE, FLAG_END_HEADERS, &headers_block_with_path("/search?q=blocked")));
+        assert_eq!(extract_path(&data), Some("/search?q=blocked".to_string()));
+    }
+
+    #[test]
+    fn extract_path_missing_pseudo_header_returns_none() {
+        let mut data = PREFACE.to_vec();
+        data.extend(frame(HEADERS_FRAME_TYPE, FLAG_END_HEADERS, &headers_block("example.com"))); // no :path
+        assert_eq!(extract_path(&data), None);
     }
 
     #[test]
