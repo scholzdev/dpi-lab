@@ -35,12 +35,32 @@ services:
 
   dpi-lab-ui:
     build: .
+    container_name: dpi-lab-ui
     # No cap_add, no network_mode: host - unprivileged by design (see
-    # events.rs's doc comment). Only needs the shared config/ + events file.
-    ports:
-      - "127.0.0.1:8080:8080" # loopback-only on the host; not network-exposed unless you reverse-proxy it
+    # events.rs's doc comment). No published ports either - Traefik reaches
+    # it over the "internal" network directly by container port, same as
+    # every other app in your apps/ stack; nothing else needs to publish
+    # 8080 on the host at all.
+    networks:
+      - internal
     volumes:
       - ./config:/app/config
       - ./data:/app/data
     command: ["ui", "--bind", "0.0.0.0:8080", "--config-dir", "/app/config", "--events-log", "/app/data/events.jsonl"]
     restart: "no"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=internal"
+      - "traefik.http.services.dpi-lab-ui.loadbalancer.server.port=8080"
+      - "traefik.http.routers.dpi-lab-ui.rule=Host(`dpi.florianscholz.me`)"
+      # TODO: confirm this matches the entrypoint name in your
+      # traefik/config/traefik.yml static config (commonly "websecure").
+      - "traefik.http.routers.dpi-lab-ui.entrypoints=websecure"
+      - "traefik.http.routers.dpi-lab-ui.tls.certresolver=stepca"
+      # This edits blocklists live - treat it like the rest of your
+      # admin-tier services, not a public one.
+      - "traefik.http.routers.dpi-lab-ui.middlewares=chain-admin@file"
+
+networks:
+  internal:
+    external: true

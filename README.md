@@ -152,7 +152,11 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 
 `docker-compose.yml` has ready-to-edit templates for all three modes,
 wired to share `config/` and `data/events.jsonl` between the capture
-container and the UI container.
+container and the UI container. `dpi-lab-ui`'s service also ships example
+Traefik v3 labels (attaches to an external `internal` network, no
+published port - Traefik reaches it by container port directly) - edit
+the `Host()` rule, entrypoint, and cert resolver to match your own setup
+before relying on them; they're illustrative, not universal defaults.
 
 **`--lockdown` and throttling don't work in this image** - they shell out
 to macOS's `pfctl`/`dnctl`, which don't exist on Linux at all (not a Docker
