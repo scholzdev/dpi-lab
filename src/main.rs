@@ -94,7 +94,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Print the block-event summary and exit - called from the Ctrl-C handler.
-fn print_summary_and_exit(stats: &BlockStats) {
+fn print_summary_and_exit(stats: &BlockStats, iface: &str) {
     let counts = stats.lock().unwrap();
     println!("\n--- block summary ---");
     if counts.is_empty() {
@@ -108,7 +108,7 @@ fn print_summary_and_exit(stats: &BlockStats) {
         }
         println!("  {:<10} {total}", "total");
     }
-    throttle::clear_all();
+    throttle::clear_all(iface);
     lockdown::clear_all();
     std::process::exit(0);
 }
@@ -305,7 +305,7 @@ fn main() {
     // here for kbit/s instead of a unix timestamp.
     let throttle_entries: Vec<(String, u32)> =
         config::load_expiry_map(&config_dir.join("throttle.yml")).into_iter().map(|(ip, kbit)| (ip, kbit as u32)).collect();
-    throttle::apply_all(&throttle_entries);
+    throttle::apply_all(&throttle_entries, &iface_name);
 
     // lockdown.yml persists ip -> unix-epoch expiry, same shape/reasoning as
     // escalated_ip.yml. Re-arm the pf anchor at startup so a restart (crash
@@ -326,7 +326,8 @@ fn main() {
 
     let block_stats: BlockStats = Arc::new(Mutex::new(HashMap::new()));
     let stats_for_handler = block_stats.clone();
-    ctrlc::set_handler(move || print_summary_and_exit(&stats_for_handler)).expect("failed to set Ctrl-C handler");
+    let iface_for_handler = iface_name.clone();
+    ctrlc::set_handler(move || print_summary_and_exit(&stats_for_handler, &iface_for_handler)).expect("failed to set Ctrl-C handler");
 
     let mut engine = Engine::new(
         inject_enabled,

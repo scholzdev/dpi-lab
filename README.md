@@ -165,12 +165,12 @@ published port - Traefik reaches it by container port directly) - edit
 the `Host()` rule, entrypoint, and cert resolver to match your own setup
 before relying on them; they're illustrative, not universal defaults.
 
-**`--lockdown` and throttling don't work in this image** - they shell out
-to macOS's `pfctl`/`dnctl`, which don't exist on Linux at all (not a Docker
-limitation, a platform one). Both fail soft: a log line and the process
-keeps running, every other mechanism (RST inject, DNS spoof, detection,
-SNI/JA3/ASN/allowlist blocking, etc.) is unaffected. See `docker-compose.yml`
-for ready-to-edit service templates.
+**`--lockdown` and throttling both work in this image** via Linux-native
+backends - `--lockdown` uses its own `nft` table (separate from `--inline`'s),
+`throttle.yml` entries use `tc` (egress-only on the capture interface, see
+`throttle.rs`'s doc comment - shapes what this host *sends*, not what it
+*receives*). `--cap-add=NET_ADMIN` (already in the run examples above)
+covers both. See `docker-compose.yml` for ready-to-edit service templates.
 
 ## Reproducing the results in writeup.md
 

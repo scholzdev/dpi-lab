@@ -10,13 +10,17 @@ COPY src ./src
 COPY ui ./ui
 RUN cargo build --release
 
-# nftables is only needed for --inline (inline.rs shells out to `nft`,
-# same as lockdown.rs/throttle.rs shell out to pfctl/dnctl on macOS) -
-# harmless to have installed and unused in passive mode. No libpcap: pnet's
-# pcap backend is an opt-in Cargo feature this project doesn't enable, the
-# default Linux backend is raw AF_PACKET sockets.
+# nftables: --inline (NFQUEUE) and --lockdown (both shell out to `nft` on
+# Linux - lockdown.rs's own dedicated table, separate from inline.rs's).
+# iproute2: provides `tc`, throttle.rs's Linux backend. conntrack-tools:
+# lets --lockdown kill already-open connections for a newly-locked IP, not
+# just block new ones (best-effort - absent is a smaller functional gap, not
+# a crash, see lockdown.rs's doc comment). All harmless to have installed
+# and unused in passive-only runs. No libpcap: pnet's pcap backend is an
+# opt-in Cargo feature this project doesn't enable, the default Linux
+# backend is raw AF_PACKET sockets.
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends nftables && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends nftables iproute2 conntrack && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /build/target/release/dpi-lab /app/dpi-lab
 COPY --from=build /build/target/release/dpi-lab-ui /app/dpi-lab-ui
