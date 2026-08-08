@@ -15,6 +15,13 @@
 // only (needs IPV6_HDRINCL, absent from macOS's raw IPv6 socket API); on
 // other platforms IPv6 RST silently no-ops, same fallback shape as
 // --redirect-dns's existing IPv6 handling.
+// dpi-lab --scan <cidr> [--scan-ports <port>]...: proactively probes every
+// host x port in <cidr> for a known proxy-protocol handshake (see
+// probe::scan_range) instead of reacting to an already-flagged flow. Only
+// runs against a CIDR that's already a literal entry in
+// config/probe_targets.yml - refuses otherwise. Defaults to ports
+// 80/443/1080/8080 if --scan-ports isn't given. Separate one-shot mode, not
+// part of the packet-capture loop.
 // --trace prints every raw TCP/UDP packet (flood); without it, only
 // classification/block events ([sni] [ja3] [host] [ech] [quic-sni] [quic-ja3]
 // [detect] [dns] [inject] [timing] [ip]) print. --block-ech requires --lockdown
@@ -152,6 +159,36 @@ fn run_inline(_args: &[String]) {
     std::process::exit(1);
 }
 
+// Real GFW-style active scanning (proactively probing a whole range for
+// circumvention-protocol servers, not just confirming an already-flagged
+// flow) is capable of scanning the entire IPv4 space - not something this
+// lab ships. `--scan` is the scoped version: only ever runs against a CIDR
+// that's already a literal entry in config/probe_targets.yml, the same
+// allow-list every other probe already respects. No entry, no scan - fails
+// closed with an explanation, not a silent no-op.
+const DEFAULT_SCAN_PORTS: [u16; 4] = [80, 443, 1080, 8080]; // http, https, common SOCKS5, common HTTP-proxy
+
+fn run_scan(cidr: &str, args: &[String]) {
+    let allowed = config::load_list(Path::new("config").join("probe_targets.yml").as_path());
+    if !allowed.iter().any(|entry| entry == cidr) {
+        eprintln!(
+            "[scan] refusing {cidr}: not a literal entry in config/probe_targets.yml - \
+             add it there first (own lab ranges only, never a third-party network)"
+        );
+        std::process::exit(1);
+    }
+    let ports: Vec<u16> = flag_values(args, "--scan-ports").into_iter().filter_map(|s| s.parse().ok()).collect();
+    let ports = if ports.is_empty() { DEFAULT_SCAN_PORTS.to_vec() } else { ports };
+    println!("[scan] scanning {cidr} on ports {ports:?}...");
+    let hits = probe::scan_range(cidr, &ports);
+    if hits.is_empty() {
+        println!("[scan] no known proxy-protocol handshakes found");
+    }
+    for (ip, port, proto) in hits {
+        println!("[scan] {ip}:{port} -> {proto}");
+    }
+}
+
 /// Collect every value following a repeatable `--flag value` pair, e.g.
 /// `--block-sni a.com --block-sni b.com` -> `["a.com", "b.com"]`.
 fn flag_values(args: &[String], flag: &str) -> Vec<String> {
@@ -168,11 +205,14 @@ fn main() {
     if args.iter().any(|a| a == "--inline") {
         return run_inline(&args);
     }
+    if let Some(cidr) = flag_values(&args, "--scan").into_iter().next() {
+        return run_scan(&cidr, &args);
+    }
 
     let iface_name = match args.get(1) {
         Some(n) => n.clone(),
         None => {
-            println!("usage: dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns]\n   or: dpi-lab --inline (Linux only, genuine in-path NFQUEUE mode - see writeup.md)\navailable interfaces:");
+            println!("usage: dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns]\n   or: dpi-lab --inline (Linux only, genuine in-path NFQUEUE mode - see writeup.md)\n   or: dpi-lab --scan <cidr> [--scan-ports <p>]...\navailable interfaces:");
             for i in datalink::interfaces() {
                 println!("  {}", i.name);
             }
