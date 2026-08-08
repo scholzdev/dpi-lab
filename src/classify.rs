@@ -576,6 +576,64 @@ pub fn parse_http_host(data: &[u8]) -> Option<String> {
     None
 }
 
+/// Extract the path and (percent-decoded) query string from a plaintext
+/// HTTP request line, e.g. `GET /search?q=blocked+term HTTP/1.1` ->
+/// `("/search", "q=blocked term")`. Query strings are encrypted under TLS
+/// regardless of version - plaintext-HTTP-only, same limitation
+/// `parse_http_host` already has. Real GFW-style deployments inspect actual
+/// search queries/URL parameters, not just "does this byte sequence appear
+/// anywhere in the stream" (see `Signatures`'s whole-stream scan) - this is
+/// that same keyword match, just scoped to the decoded query value so a
+/// match there is distinguishable from one anywhere else in the request.
+pub fn parse_http_request_line(data: &[u8]) -> Option<(String, String)> {
+    let text = std::str::from_utf8(data).ok()?;
+    let line = text.split("\r\n").next()?;
+    let mut parts = line.split(' ');
+    let _method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None; // doesn't look like a real request line, not just any two space-separated tokens
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    Some((path.to_string(), percent_decode(query)))
+}
+
+/// `application/x-www-form-urlencoded`-style decoding (RFC 3986 §2.1 plus
+/// the `+` -> space convention query strings use): `%XX` -> that byte, `+`
+/// -> space, everything else passed through. Malformed `%` sequences (not
+/// two hex digits) are left as literal bytes rather than erroring - a
+/// keyword scan shouldn't give up on an entire query string over one bad
+/// escape.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 3 <= bytes.len() => match std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                None => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// One known protocol handshake signature: an optional exact total length,
 /// plus a set of (offset, expected bytes) anchors that must all match. Fixed
 /// wire-format handshakes (WireGuard, OpenVPN, ...) are recognized this way -
@@ -1145,5 +1203,39 @@ mod tests {
     #[test]
     fn http_host_missing_returns_none() {
         assert!(parse_http_host(b"GET / HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn request_line_extracts_path_and_decoded_query() {
+        let (path, query) = parse_http_request_line(b"GET /search?q=blocked+term HTTP/1.1\r\nHost: example.com\r\n\r\n").unwrap();
+        assert_eq!(path, "/search");
+        assert_eq!(query, "q=blocked term");
+    }
+
+    #[test]
+    fn request_line_percent_decodes_special_characters() {
+        let (_, query) = parse_http_request_line(b"GET /search?q=100%25%20blocked HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(query, "q=100% blocked");
+    }
+
+    #[test]
+    fn request_line_no_query_is_empty_string_not_none() {
+        let (path, query) = parse_http_request_line(b"GET /index.html HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(path, "/index.html");
+        assert_eq!(query, "");
+    }
+
+    #[test]
+    fn request_line_malformed_percent_escape_kept_literal() {
+        // "%zz" isn't valid hex - passed through byte-for-byte rather than
+        // dropped or erroring the whole query out.
+        let (_, query) = parse_http_request_line(b"GET /x?a=%zz HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(query, "a=%zz");
+    }
+
+    #[test]
+    fn request_line_missing_or_malformed_is_none() {
+        assert!(parse_http_request_line(b"not an http request at all").is_none());
+        assert!(parse_http_request_line(b"").is_none());
     }
 }

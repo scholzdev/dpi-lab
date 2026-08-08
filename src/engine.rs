@@ -777,6 +777,23 @@ impl Engine {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "host");
                     }
                 }
+                // Same request line already parsed for the Host header -
+                // real deployments inspect actual search queries/URL
+                // parameters, not just "does this keyword appear anywhere
+                // in the stream" (see the whole-stream signature scan
+                // above). Plaintext HTTP only, same limitation the Host
+                // check above already has.
+                if let Some((path, query)) = classify::parse_http_request_line(&state.stream.delivered) {
+                    if !query.is_empty() {
+                        for hit in self.sigs.matches(query.as_bytes()) {
+                            log::info!("  [url-keyword] {hit} in {src}:{sport} -> {dst}:{dport}  path={path}");
+                            block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "url-keyword", hit);
+                            if self.lockdown_enabled {
+                                lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "url-keyword");
+                            }
+                        }
+                    }
+                }
                 state.host_checked = true;
             } else if state.stream.delivered.len() >= CLIENTHELLO_CAP {
                 state.host_checked = true; // give up - not a plaintext HTTP request
