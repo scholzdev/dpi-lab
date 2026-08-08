@@ -33,6 +33,9 @@ pub struct ClientHello {
     pub extensions: Vec<u16>,   // in wire order, GREASE included (callers filter as needed)
     pub curves: Vec<u16>,       // supported_groups extension (10)
     pub ec_point_formats: Vec<u8>, // ec_point_formats extension (11)
+    pub alpn: Vec<String>,      // application_layer_protocol_negotiation extension (16), in offered order
+    pub signature_algorithms: Vec<u16>, // signature_algorithms extension (13), in wire order - JA4 needs this
+    pub supported_versions: Vec<u16>, // supported_versions extension (0x002b) - JA4's actual version signal
     /// True if the "encrypted_client_hello" extension (0xfe0d, current IANA
     /// codepoint used by Chrome/Cloudflare/Firefox deployments) is present.
     /// When set, `sni` is the *outer* ClientHello's - decoy - SNI, not the
@@ -102,6 +105,9 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello> {
     let mut extensions = Vec::new();
     let mut curves = Vec::new();
     let mut ec_point_formats = Vec::new();
+    let mut alpn = Vec::new();
+    let mut signature_algorithms = Vec::new();
+    let mut supported_versions = Vec::new();
     let mut has_ech = false;
 
     while p + 4 <= ext_end && p + 4 <= hs.len() {
@@ -126,13 +132,46 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello> {
                 let list_len = *ext_data.get(0)? as usize;
                 ec_point_formats = ext_data.get(1..1 + list_len)?.to_vec();
             }
+            0x000d => {
+                // signature_algorithms (RFC 8446 SS4.2.3): list_len(2), then u16 scheme IDs
+                let list_len = u16::from_be_bytes([*ext_data.get(0)?, *ext_data.get(1)?]) as usize;
+                signature_algorithms =
+                    ext_data.get(2..2 + list_len)?.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+            }
+            0x0010 => {
+                // ALPN (RFC 7301): protocol_name_list_len(2), then (len(1)+name) entries
+                let list_len = u16::from_be_bytes([*ext_data.get(0)?, *ext_data.get(1)?]) as usize;
+                let mut list = ext_data.get(2..2 + list_len)?;
+                while let Some(&name_len) = list.first() {
+                    let name = list.get(1..1 + name_len as usize)?;
+                    alpn.push(String::from_utf8_lossy(name).into_owned());
+                    list = list.get(1 + name_len as usize..)?;
+                }
+            }
+            0x002b => {
+                // supported_versions (RFC 8446 SS4.2.1): list_len(1), then u16 version entries
+                let list_len = *ext_data.get(0)? as usize;
+                supported_versions =
+                    ext_data.get(1..1 + list_len)?.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+            }
             0xfe0d => has_ech = true, // encrypted_client_hello - contents are opaque, presence is the signal
             _ => {}
         }
         p += 4 + ext_len;
     }
 
-    Some(ClientHello { version, sni, cipher_suites, extensions, curves, ec_point_formats, has_ech })
+    Some(ClientHello {
+        version,
+        sni,
+        cipher_suites,
+        extensions,
+        curves,
+        ec_point_formats,
+        alpn,
+        signature_algorithms,
+        supported_versions,
+        has_ech,
+    })
 }
 
 /// In-place TLS 1.3->1.2 forced downgrade (`--inline --downgrade-tls13`
@@ -241,6 +280,150 @@ pub fn ja3(data: &[u8]) -> Option<(String, String)> {
     );
     let digest = md5::compute(ja3_string.as_bytes());
     Some((ja3_string, format!("{digest:x}")))
+}
+
+/// Fields pulled from a TLS ServerHello - the server-side counterpart of
+/// `ClientHello`, for JA3S. Unlike ClientHello's cipher_suites (a list the
+/// client offers), a ServerHello names exactly the one cipher the server
+/// picked - singular by the wire format itself, not a simplification.
+pub struct ServerHello {
+    pub version: u16,
+    pub cipher_suite: u16,
+    pub extensions: Vec<u16>,
+}
+
+/// Parse a TLS ServerHello - same record/handshake framing as
+/// `parse_client_hello`, simpler body (RFC 8446 SS4.1.3 / RFC 5246 SS7.4.1.3):
+/// version(2) random(32) session_id_len(1)+id cipher_suite(2)
+/// compression_method(1) extensions_len(2)+extensions. Always sent in the
+/// clear at the record layer in both TLS 1.2 and 1.3 - encryption only
+/// starts after the key material this message carries is derived - so this
+/// works on either version, no version branch needed.
+pub fn parse_server_hello(data: &[u8]) -> Option<ServerHello> {
+    let rec_type = *data.get(0)?;
+    if rec_type != 0x16 {
+        return None;
+    }
+    let rec_len = u16::from_be_bytes([*data.get(3)?, *data.get(4)?]) as usize;
+    let body = data.get(5..5 + rec_len)?;
+
+    if *body.get(0)? != 0x02 {
+        return None; // not a ServerHello
+    }
+    let hs_len = u32::from_be_bytes([0, body[1], body[2], body[3]]) as usize;
+    let hs = body.get(4..4 + hs_len)?;
+
+    let version = u16::from_be_bytes([*hs.get(0)?, *hs.get(1)?]);
+
+    let mut p = 2 + 32;
+    let sid_len = *hs.get(p)? as usize;
+    p += 1 + sid_len;
+
+    let cipher_suite = u16::from_be_bytes([*hs.get(p)?, *hs.get(p + 1)?]);
+    p += 2;
+    p += 1; // compression_method - single byte, unlike ClientHello's list
+
+    let ext_total = u16::from_be_bytes([*hs.get(p)?, *hs.get(p + 1)?]) as usize;
+    p += 2;
+    let ext_end = p + ext_total;
+
+    let mut extensions = Vec::new();
+    while p + 4 <= ext_end && p + 4 <= hs.len() {
+        let ext_type = u16::from_be_bytes([hs[p], hs[p + 1]]);
+        let ext_len = u16::from_be_bytes([hs[p + 2], hs[p + 3]]) as usize;
+        if hs.get(p + 4..p + 4 + ext_len).is_none() {
+            break;
+        }
+        extensions.push(ext_type);
+        p += 4 + ext_len;
+    }
+
+    Some(ServerHello { version, cipher_suite, extensions })
+}
+
+/// JA3S: the server-fingerprint counterpart of JA3 (same Salesforce spec,
+/// same GREASE-stripping convention). MD5 of "version,cipher,extensions" -
+/// useful independent of SNI/JA3, e.g. spotting a fake/self-signed cert
+/// server serving a distinctive TLS stack fingerprint regardless of what
+/// hostname the client asked for.
+pub fn ja3s(data: &[u8]) -> Option<(String, String)> {
+    let sh = parse_server_hello(data)?;
+    let join = |v: &[u16]| v.iter().filter(|x| !is_grease(**x)).map(|x| x.to_string()).collect::<Vec<_>>().join("-");
+    let ja3s_string = format!("{},{},{}", sh.version, sh.cipher_suite, join(&sh.extensions));
+    let digest = md5::compute(ja3s_string.as_bytes());
+    Some((ja3s_string, format!("{digest:x}")))
+}
+
+/// JA4 (FoxIO spec, TLS-client variant only - not the JA4S/JA4H/JA4L
+/// protocol-family siblings). Format: `t{version}{sni}{ciphers:02}{exts:02}{alpn}_{cipher-hash}_{ext-hash}`.
+/// GREASE excluded from every list before counting/hashing, same convention
+/// as JA3.
+///
+/// ponytail: reasonably faithful, not a byte-for-byte guarantee against the
+/// reference implementation on every edge case - e.g. this truncates a
+/// non-ASCII/multi-byte-first-char ALPN value's "first/last char" by raw
+/// byte rather than the spec's own edge-case handling for non-alphanumeric
+/// protocol IDs. Real-world ALPN values (`h2`, `http/1.1`, `h3`) all hit the
+/// common path correctly; upgrade path if it matters is closer spec-reading
+/// for the uncommon ones, not a rewrite.
+pub fn ja4(data: &[u8]) -> Option<String> {
+    let ch = parse_client_hello(data)?;
+
+    // Version code: JA4 wants the real negotiated-max version, which for a
+    // real TLS 1.3 client lives in supported_versions (the legacy top-level
+    // `version` field stays 0x0303/TLS-1.2 for backward compat on those
+    // clients) - falls back to the legacy field only when the extension is
+    // absent (a genuine <=1.2-only client).
+    let versions: Vec<u16> = ch.supported_versions.iter().copied().filter(|v| !is_grease(*v)).collect();
+    let effective_version = versions.into_iter().max().unwrap_or(ch.version);
+    let version_code = match effective_version {
+        0x0304 => "13",
+        0x0303 => "12",
+        0x0302 => "11",
+        0x0301 => "10",
+        0x0300 => "s3",
+        _ => "00",
+    };
+
+    let sni_flag = if ch.sni.is_some() { "d" } else { "i" };
+
+    let ciphers: Vec<u16> = ch.cipher_suites.iter().copied().filter(|c| !is_grease(*c)).collect();
+    let extensions: Vec<u16> = ch.extensions.iter().copied().filter(|e| !is_grease(*e)).collect();
+    let cipher_count = ciphers.len().min(99);
+    let ext_count = extensions.len().min(99);
+
+    let alpn_code = match ch.alpn.first() {
+        Some(proto) if !proto.is_empty() => {
+            let first = proto.as_bytes()[0] as char;
+            let last = proto.as_bytes()[proto.len() - 1] as char;
+            format!("{first}{last}")
+        }
+        _ => "00".to_string(),
+    };
+
+    let mut sorted_ciphers = ciphers.clone();
+    sorted_ciphers.sort_unstable();
+    let cipher_hash = truncated_sha256_hex(&sorted_ciphers.iter().map(|c| format!("{c:04x}")).collect::<Vec<_>>().join(","));
+
+    // Extension hash payload excludes SNI(0x0000) and ALPN(0x0010) - JA4
+    // already encodes their presence/value separately (sni_flag, alpn_code)
+    // - plus the signature_algorithms list appended in its original
+    // (unsorted) order, per spec.
+    let mut sorted_exts: Vec<u16> = extensions.iter().copied().filter(|e| *e != 0x0000 && *e != 0x0010).collect();
+    sorted_exts.sort_unstable();
+    let ext_part = sorted_exts.iter().map(|e| format!("{e:04x}")).collect::<Vec<_>>().join(",");
+    let sig_alg_part = ch.signature_algorithms.iter().map(|s| format!("{s:04x}")).collect::<Vec<_>>().join(",");
+    let ext_hash = truncated_sha256_hex(&format!("{ext_part}_{sig_alg_part}"));
+
+    Some(format!("t{version_code}{sni_flag}{cipher_count:02}{ext_count:02}{alpn_code}_{cipher_hash}_{ext_hash}"))
+}
+
+/// First 12 hex chars of SHA256(s) - JA4's own truncation convention. Uses
+/// `ring::digest` (already a dependency for QUIC's AEAD/HKDF) rather than
+/// adding a dedicated sha2 crate for one call site.
+fn truncated_sha256_hex(s: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
+    digest.as_ref().iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Extract CN + SAN DNS names from a TLS <=1.2 Certificate handshake message
@@ -760,6 +943,147 @@ mod tests {
         let (ja3_string, hash) = ja3(&record).unwrap();
         assert_eq!(ja3_string, "771,4865,10-11,29,0"); // 0x1301=4865, 0x001d=29
         assert_eq!(hash.len(), 32); // md5 hex digest
+    }
+
+    fn build_server_hello(version: u16, cipher_suite: u16, ext_types: &[u16]) -> Vec<u8> {
+        let mut ext = vec![];
+        for &t in ext_types {
+            ext.extend_from_slice(&t.to_be_bytes());
+            ext.extend_from_slice(&0u16.to_be_bytes()); // empty extension data, fine for JA3S (only types matter)
+        }
+
+        let mut hs = vec![];
+        hs.extend_from_slice(&version.to_be_bytes());
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.push(0); // session_id_len
+        hs.extend_from_slice(&cipher_suite.to_be_bytes());
+        hs.push(0); // compression_method
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+
+        let mut handshake = vec![0x02]; // ServerHello
+        handshake.extend_from_slice(&(hs.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&hs);
+
+        let mut record = vec![0x16, 0x03, 0x03];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn ja3s_extracts_version_cipher_and_extensions_strips_grease() {
+        let record = build_server_hello(0x0303, 0x1301, &[0x0a0a, 0x0000, 0x002b]); // GREASE + server_name + supported_versions
+        let (ja3s_string, hash) = ja3s(&record).unwrap();
+        assert_eq!(ja3s_string, "771,4865,0-43"); // GREASE stripped, 0x002b=43
+        assert_eq!(hash.len(), 32);
+    }
+
+    #[test]
+    fn ja3s_rejects_client_hello() {
+        // A ServerHello parser must not accept a ClientHello (handshake type
+        // 0x01, not 0x02) even though the record framing looks the same.
+        let record = client_hello_with_supported_versions(&[0x0304]);
+        assert!(parse_server_hello(&record).is_none());
+        assert!(ja3s(&record).is_none());
+    }
+
+    /// Build a ClientHello with all the extensions JA4 reads: SNI (so
+    /// sni_flag="d"), two real ciphers + one GREASE, ALPN "h2", one
+    /// signature_algorithms entry, and supported_versions offering TLS 1.3.
+    fn build_ja4_client_hello() -> Vec<u8> {
+        let sni_ext = {
+            let mut list = vec![0u8]; // name_type = host_name
+            let host = b"example.com";
+            list.extend_from_slice(&(host.len() as u16).to_be_bytes());
+            list.extend_from_slice(host);
+            let mut d = (list.len() as u16).to_be_bytes().to_vec();
+            d.extend_from_slice(&list);
+            d
+        };
+        let alpn_ext = {
+            let mut list = vec![2u8]; // len("h2")
+            list.extend_from_slice(b"h2");
+            let mut d = (list.len() as u16).to_be_bytes().to_vec();
+            d.extend_from_slice(&list);
+            d
+        };
+        let sig_algs_ext = {
+            let entries: Vec<u8> = [0x0403u16].iter().flat_map(|v| v.to_be_bytes()).collect(); // ecdsa_secp256r1_sha256
+            let mut d = (entries.len() as u16).to_be_bytes().to_vec();
+            d.extend_from_slice(&entries);
+            d
+        };
+        let sv_ext = {
+            let entries: Vec<u8> = [0x0a0au16, 0x0304].iter().flat_map(|v| v.to_be_bytes()).collect(); // GREASE + TLS 1.3
+            let mut d = vec![entries.len() as u8];
+            d.extend_from_slice(&entries);
+            d
+        };
+
+        let mut ext = vec![];
+        for (t, data) in [(0x0000u16, &sni_ext), (0x0010, &alpn_ext), (0x000d, &sig_algs_ext), (0x002b, &sv_ext)] {
+            ext.extend_from_slice(&t.to_be_bytes());
+            ext.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            ext.extend_from_slice(data);
+        }
+
+        let mut hs = vec![0x03, 0x03]; // legacy version - real 1.3 signal is in supported_versions
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.push(0);
+        let ciphers = [0x0a0au16, 0x1301, 0x1302]; // GREASE + two real ciphers
+        let cipher_bytes: Vec<u8> = ciphers.iter().flat_map(|v| v.to_be_bytes()).collect();
+        hs.extend_from_slice(&(cipher_bytes.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&cipher_bytes);
+        hs.push(1);
+        hs.push(0);
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(hs.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&hs);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn ja4_uses_supported_versions_not_legacy_field_for_tls13() {
+        let record = build_ja4_client_hello();
+        let fp = ja4(&record).unwrap();
+        // t=TCP, 13=TLS1.3 (from supported_versions, not the 0x0303 legacy
+        // field), d=SNI present, 02 ciphers, 04 extensions, h2 ALPN.
+        assert!(fp.starts_with("t13d0204h2_"), "got {fp}");
+        let parts: Vec<&str> = fp.split('_').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[1].len(), 12); // truncated sha256 hex
+        assert_eq!(parts[2].len(), 12);
+    }
+
+    #[test]
+    fn ja4_no_sni_flags_i_and_no_alpn_is_00() {
+        // Minimal ClientHello with none of JA4's optional extensions.
+        let mut hs = vec![0x03, 0x03];
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.push(0);
+        hs.extend_from_slice(&2u16.to_be_bytes());
+        hs.extend_from_slice(&[0x13, 0x01]);
+        hs.push(1);
+        hs.push(0);
+        hs.extend_from_slice(&0u16.to_be_bytes()); // no extensions at all
+
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(hs.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&hs);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+
+        let fp = ja4(&record).unwrap();
+        assert!(fp.starts_with("t12i010000_"), "got {fp}"); // no supported_versions -> legacy 0x0303 -> "12"; no ALPN -> "00"
     }
 
     #[test]

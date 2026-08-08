@@ -1,0 +1,3 @@
+# --block-ja4 <fingerprint>... - JA4 (FoxIO spec, TLS-client variant only,
+# see classify::ja4) fingerprints, format like t13d1516h2_xxxxxxxxxxxx_xxxxxxxxxxxx.
+# Empty by default - add fingerprints captured from your own [ja4] log lines.

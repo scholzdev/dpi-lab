@@ -124,6 +124,7 @@ struct FlowState {
     host_checked: bool, // plaintext HTTP Host: header, once per flow - see classify::parse_http_host
     cert_checked: bool, // TLS <=1.2 Certificate message CN/SAN, once per flow - see classify::parse_tls_certificate_names
     h2_authority_checked: bool, // HTTP/2 :authority pseudo-header, once per flow - see h2::extract_authority
+    ja3s_checked: bool, // server-side JA3 (ServerHello), once per flow - see classify::ja3s
     last_seen: Instant, // for idle eviction, see prune_idle_flows
     tls_segment_count: u32, // non-empty segments seen on a TLS-like port before ClientHello resolved
     fragmentation_flagged: bool, // single-shot, like checked_entropy - don't spam the log
@@ -144,6 +145,8 @@ pub struct Engine {
     dns_redirect_v6: Option<(HashMap<String, std::net::Ipv6Addr>, redirect::Ipv6DnsSender)>, // None if platform lacks IPV6_HDRINCL
     blocked_sni: Vec<String>,
     blocked_ja3: Vec<String>,
+    blocked_ja3s: Vec<String>, // server-side JA3 counterpart, see classify::ja3s
+    blocked_ja4: Vec<String>,
     blocked_ip: Vec<(String, Option<Instant>)>, // (ip, expiry) - None = permanent, Some = auto-escalated
     allowlist: Vec<String>, // IP/CIDR allow-list, only meaningful when allowlist_only is set
     allowlist_only: bool, // default-deny: block everything NOT on `allowlist`, ignoring blocked_ip entirely
@@ -171,6 +174,8 @@ impl Engine {
         redirect_enabled: bool,
         blocked_sni: Vec<String>,
         blocked_ja3: Vec<String>,
+        blocked_ja3s: Vec<String>,
+        blocked_ja4: Vec<String>,
         blocked_ip: Vec<(String, Option<Duration>)>, // (ip, remaining TTL); None = permanent
         allowlist: Vec<String>,
         allowlist_only: bool,
@@ -241,6 +246,12 @@ impl Engine {
         for h in &blocked_ja3 {
             println!("[block-ja3] {h}");
         }
+        for h in &blocked_ja3s {
+            println!("[block-ja3s] {h}");
+        }
+        for h in &blocked_ja4 {
+            println!("[block-ja4] {h}");
+        }
         for (ip, ttl) in &blocked_ip {
             match ttl {
                 Some(d) => println!("[block-ip] {ip} (expires in {}s)", d.as_secs()),
@@ -292,6 +303,8 @@ impl Engine {
             dns_redirect_v6,
             blocked_sni,
             blocked_ja3,
+            blocked_ja3s,
+            blocked_ja4,
             blocked_ip,
             allowlist,
             allowlist_only,
@@ -463,6 +476,7 @@ impl Engine {
                 host_checked: false,
                 cert_checked: false,
                 h2_authority_checked: false,
+                ja3s_checked: false,
                 last_seen: Instant::now(),
                 tls_segment_count: 0,
                 fragmentation_flagged: false,
@@ -603,6 +617,15 @@ impl Engine {
                         }
                     }
                 }
+                if let Some(ja4_fp) = classify::ja4(buf) {
+                    println!("  [ja4] {src}:{sport} -> {dst}:{dport}  ja4={ja4_fp}");
+                    if self.blocked_ja4.iter().any(|h| h == &ja4_fp) {
+                        block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja4", &ja4_fp);
+                        if self.lockdown_enabled {
+                            lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja4");
+                        }
+                    }
+                }
                 if let Some((_, name)) = self.doh_providers.iter().find(|(rule, _)| ip_rule_matches(rule, &dst)) {
                     println!("  [doh] {src}:{sport} -> {dst}:{dport}  known DoH/DoT resolver ({name})");
                     if self.block_doh {
@@ -712,6 +735,26 @@ impl Engine {
             }
         }
 
+        // JA3S: the server-side counterpart of JA3, from the ServerHello
+        // (server->client direction, same "try, no-op on the wrong
+        // direction's bytes" reasoning as the cert check above). Useful
+        // independent of SNI - e.g. flagging a distinctive/fake TLS stack
+        // regardless of what hostname the client asked for.
+        if !state.ja3s_checked && !state.stream.delivered.is_empty() {
+            if let Some((ja3s_string, hash)) = classify::ja3s(&state.stream.delivered) {
+                println!("  [ja3s] {src}:{sport} -> {dst}:{dport}  ja3s={hash} ({ja3s_string})");
+                if self.blocked_ja3s.iter().any(|h| h == &hash) {
+                    block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja3s", &hash);
+                    if self.lockdown_enabled {
+                        lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "ja3s");
+                    }
+                }
+                state.ja3s_checked = true;
+            } else if state.stream.delivered.len() >= CLIENTHELLO_CAP {
+                state.ja3s_checked = true; // give up - not a ServerHello
+            }
+        }
+
         // HTTP/2's :authority pseudo-header names the destination the way
         // HTTP/1.1's Host: header does, just HPACK-compressed - only fires on
         // the client->server direction (the one carrying the preface).
@@ -815,6 +858,12 @@ impl Engine {
                         if self.lockdown_enabled {
                             lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja3");
                         }
+                    }
+                }
+                if let Some(ja4_fp) = classify::ja4(&record) {
+                    println!("  [quic-ja4] {src}:{sport} -> {dst}:{dport}  ja4={ja4_fp}");
+                    if self.blocked_ja4.iter().any(|h| h == &ja4_fp) && self.lockdown_enabled {
+                        lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja4");
                     }
                 }
                 if let Some(name) = classify::parse_sni(&record) {
@@ -962,7 +1011,7 @@ mod tests {
     #[test]
     fn prune_expired_ips_drops_only_expired_entries() {
         // inject/redirect both off, so no raw socket (root) needed.
-        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![
+        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
@@ -976,7 +1025,7 @@ mod tests {
 
     #[test]
     fn prune_idle_flows_drops_stale_entries() {
-        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
+        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
         .unwrap();
         let stale_key = ("10.0.0.1".parse().unwrap(), 1, "10.0.0.2".parse().unwrap(), 2);
         let fresh_key = ("10.0.0.3".parse().unwrap(), 3, "10.0.0.4".parse().unwrap(), 4);
@@ -993,6 +1042,7 @@ mod tests {
             host_checked: false,
                 cert_checked: false,
                 h2_authority_checked: false,
+                ja3s_checked: false,
             last_seen: Instant::now(),
             tls_segment_count: 0,
             fragmentation_flagged: false,
@@ -1011,6 +1061,7 @@ mod tests {
             host_checked: false,
                 cert_checked: false,
                 h2_authority_checked: false,
+                ja3s_checked: false,
             last_seen: Instant::now(),
             tls_segment_count: 0,
             fragmentation_flagged: false,

@@ -1,0 +1,4 @@
+# --block-ja3s <hash>... - JA3S is the server-side counterpart of JA3 (same
+# Salesforce spec): MD5 of "version,cipher,extensions" from the ServerHello.
+# Useful for flagging a distinctive/fake TLS stack independent of hostname.
+# Empty by default - add hashes captured from your own [ja3s] log lines.

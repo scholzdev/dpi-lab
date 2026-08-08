@@ -1,6 +1,7 @@
 // Live capture -> engine pipeline (decode/reassemble/classify/inject/redirect).
 // Run: sudo ./target/debug/dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns] [--trace]
-//      [--block-sni <domain>]... [--block-ja3 <hash>]... [--block-ip <ip>]... [--block-sig <keyword>]...
+//      [--block-sni <domain>]... [--block-ja3 <hash>]... [--block-ja3s <hash>]... [--block-ja4 <fp>]...
+//      [--block-ip <ip>]... [--block-sig <keyword>]...
 //      [--lockdown] [--block-ech] [--block-quic] [--allowlist-only] [--block-asn <num>]... [--block-doh]
 // --allowlist-only: default-deny mode - block every flow whose src/dst isn't
 // in config/allowlist.yml (IP/CIDR), ignoring block_ip/sni/ja3/etc entirely.
@@ -215,6 +216,10 @@ fn main() {
     block_sni.extend(flag_values(&args, "--block-sni"));
     let mut block_ja3 = config::load_list(&config_dir.join("ja3.yml"));
     block_ja3.extend(flag_values(&args, "--block-ja3"));
+    let mut block_ja3s = config::load_list(&config_dir.join("ja3s.yml"));
+    block_ja3s.extend(flag_values(&args, "--block-ja3s"));
+    let mut block_ja4 = config::load_list(&config_dir.join("ja4.yml"));
+    block_ja4.extend(flag_values(&args, "--block-ja4"));
     // escalated_ip.yml holds IPs auto-blocked by a previous run (ip -> unix-epoch
     // expiry, see engine.rs's escalation logic) - merged in here so they stay
     // blocked across restarts, with the remaining TTL carried over. Already-expired
@@ -276,6 +281,8 @@ fn main() {
         redirect_enabled,
         block_sni,
         block_ja3,
+        block_ja3s,
+        block_ja4,
         block_ip,
         allowlist,
         allowlist_only,
