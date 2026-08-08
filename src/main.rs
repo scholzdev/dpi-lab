@@ -11,6 +11,9 @@
 // ASN database; config/asn.yml ships documented example ranges only.
 // --block-doh: escalate [doh] (known public DoH/DoT resolver IP match, see
 // config/doh_providers.yml) from log-only to an actual block.
+// --block-fronting: escalate [fronting] (ClientHello SNI doesn't match any
+// name on the server's own TLS <=1.2 certificate - the observable proxy for
+// domain fronting) from log-only to an actual block.
 // --events-log <path>: append one JSON line per real block/lockdown event
 // to <path>, for dpi-lab-ui's live dashboard (see events.rs, src/bin/
 // dpi-lab-ui.rs). Off by default - no file, no writes.
@@ -259,6 +262,12 @@ fn main() {
     // known public resolver (config/doh_providers.yml); --block-doh escalates
     // that to an actual block instead of log-only.
     let block_doh = args.iter().any(|a| a == "--block-doh");
+    // [fronting] logs whenever a ClientHello's SNI doesn't match any name on
+    // the server's own TLS <=1.2 certificate - the observable proxy for
+    // domain fronting passive capture can actually see (the real encrypted
+    // request inside is invisible either way). --block-fronting escalates
+    // that to an actual block instead of log-only.
+    let block_fronting = args.iter().any(|a| a == "--block-fronting");
     // Structured JSONL for the web UI's live dashboard (src/bin/dpi-lab-ui.rs)
     // - off by default, same opt-in shape as every other optional feature
     // here. See events.rs for why this is a file, not an in-process channel.
@@ -354,6 +363,7 @@ fn main() {
         block_quic,
         doh_providers,
         block_doh,
+        block_fronting,
         trace,
         block_stats,
         events_log_path,

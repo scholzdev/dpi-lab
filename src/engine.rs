@@ -161,6 +161,7 @@ pub struct Engine {
     block_quic: bool, // force QUIC->TCP downgrade: blanket-drop UDP:443, see lockdown::build_ruleset
     doh_providers: Vec<(String, String)>, // ip_or_cidr -> name, see config/doh_providers.yml
     block_doh: bool, // off by default: [doh] just logs unless this is set
+    block_fronting: bool, // off by default: [fronting] just logs unless this is set
     trace: bool, // print every raw packet, not just classification/block events
     block_stats: BlockStats,
     escalation: HashMap<IpAddr, (u32, Instant)>, // offense count + window start, per source IP
@@ -203,6 +204,7 @@ impl Engine {
         block_quic: bool,
         doh_providers: Vec<(String, String)>,
         block_doh: bool,
+        block_fronting: bool,
         trace: bool,
         block_stats: BlockStats,
         events_log_path: Option<std::path::PathBuf>,
@@ -297,6 +299,9 @@ impl Engine {
         if block_doh {
             log::info!("[block-doh] blocking on known DoH/DoT resolver IP match ({} providers loaded)", doh_providers.len());
         }
+        if block_fronting {
+            log::info!("[block-fronting] blocking on SNI/certificate-name mismatch (TLS <=1.2 only)");
+        }
         let now = Instant::now();
         let blocked_ip = blocked_ip.into_iter().map(|(ip, ttl)| (ip, ttl.map(|d| now + d))).collect();
         let lockdown_ips = lockdown_ips.into_iter().map(|(ip, d)| (ip, now + d)).collect();
@@ -331,6 +336,7 @@ impl Engine {
             block_quic,
             doh_providers,
             block_doh,
+            block_fronting,
             trace,
             block_stats,
             escalation: HashMap::new(),
@@ -516,6 +522,14 @@ impl Engine {
         } else {
             None
         };
+
+        // Same reason as cannon_server_seq above - needs a second
+        // self.streams lookup (the reverse flow's SNI, for the fronting
+        // check below) before `state` borrows self.streams for this
+        // direction. `dst`/`dport`/`src`/`sport` here are this (likely
+        // server->client) flow's; the reverse (client->server) flow is
+        // keyed by swapping them.
+        let expected_sni = self.streams.get(&(dst, dport, src, sport)).and_then(|s| s.sni.clone());
 
         let state = self.streams.entry(key).or_insert_with(|| {
             // SYN's seq is the ISN; first data byte is ISN+1.
@@ -781,6 +795,26 @@ impl Engine {
                     block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "cert", &names.join(","));
                     if self.lockdown_enabled {
                         lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "cert");
+                    }
+                }
+                // Domain fronting proxy: the ClientHello's SNI (from the
+                // reverse client->server flow, looked up as expected_sni
+                // above) should name one of the identities this certificate
+                // actually presents. A mismatch means the client announced
+                // one destination in the clear and the server that answered
+                // presents a completely different identity - the observable
+                // shadow of "SNI says A, real traffic goes to B" fronting,
+                // since the real encrypted request inside is invisible to
+                // passive capture either way.
+                if let Some(expected) = &expected_sni {
+                    if !names.iter().any(|n| n == expected) {
+                        log::info!("  [fronting] {src}:{sport} -> {dst}:{dport}  sni={expected} cert-names={names:?}");
+                        if self.block_fronting {
+                            block(self.injector.as_mut(), self.injector_v6.as_ref(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, &self.events, tcp, src, sport, dst, dport, payload, "fronting", expected);
+                            if self.lockdown_enabled {
+                                lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "fronting");
+                            }
+                        }
                     }
                 }
                 state.cert_checked = true;
@@ -1083,7 +1117,7 @@ mod tests {
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
-        ], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None, std::path::PathBuf::from("config"))
+        ], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, false, Arc::new(Mutex::new(HashMap::new())), None, std::path::PathBuf::from("config"))
         .unwrap();
         std::thread::sleep(Duration::from_millis(5)); // let the zero-TTL entry actually pass
         engine.prune_expired_ips();
@@ -1093,7 +1127,7 @@ mod tests {
 
     #[test]
     fn prune_idle_flows_drops_stale_entries() {
-        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None, std::path::PathBuf::from("config"))
+        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, false, Arc::new(Mutex::new(HashMap::new())), None, std::path::PathBuf::from("config"))
         .unwrap();
         let stale_key = ("10.0.0.1".parse().unwrap(), 1, "10.0.0.2".parse().unwrap(), 2);
         let fresh_key = ("10.0.0.3".parse().unwrap(), 3, "10.0.0.4".parse().unwrap(), 4);
@@ -1180,7 +1214,7 @@ mod tests {
         std::fs::write(dir.join("sni.yml"), "- original.example\n").unwrap();
 
         let mut engine =
-            Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())), None, dir.clone())
+            Engine::new(false, false, false, vec![], vec![], vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, vec![], false, false, false, Arc::new(Mutex::new(HashMap::new())), None, dir.clone())
                 .unwrap();
         // Engine::new's blocked_sni param is independent of config_dir (main.rs
         // loads it once itself and passes the Vec in) - starts empty here since
