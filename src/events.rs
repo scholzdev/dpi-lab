@@ -11,7 +11,7 @@
 use serde::Serialize;
 use std::io::Write;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
 struct Event<'a> {
@@ -23,6 +23,12 @@ struct Event<'a> {
     dport: u16,
     detail: &'a str,
 }
+
+/// Rotate to `<path>.1` once the active file passes this size - one
+/// rotation slot, not a numbered chain, kept deliberately simple for a lab
+/// tool's event volume (each line is a real block/lockdown, not every
+/// packet - this is a lot of events even at 10MB).
+const MAX_EVENTS_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 pub struct EventLog {
     path: Option<PathBuf>,
@@ -41,6 +47,7 @@ impl EventLog {
     /// packet processing should ever depend on succeeding.
     pub fn emit(&self, kind: &str, src: IpAddr, dst: IpAddr, sport: u16, dport: u16, detail: &str) {
         let Some(path) = &self.path else { return };
+        rotate_if_needed(path);
         let event = Event {
             time: humantime_now(),
             kind,
@@ -57,6 +64,30 @@ impl EventLog {
             log::error!("[events] failed to write {}: {e}", path.display());
         }
     }
+}
+
+/// If `path` exists and is past `MAX_EVENTS_LOG_BYTES`, rename it to
+/// `<path>.1` (clobbering any prior `.1`) so the next write starts a fresh
+/// file. Checked before every write rather than on a timer - this is a lab
+/// tool, one extra `metadata()` call per emitted event (not per packet) is
+/// noise. Best-effort: a failed rotation just means the file keeps growing
+/// past the threshold this once, logged, never blocks the actual event
+/// write that follows.
+fn rotate_if_needed(path: &PathBuf) {
+    let Ok(meta) = std::fs::metadata(path) else { return }; // doesn't exist yet - nothing to rotate
+    if meta.len() < MAX_EVENTS_LOG_BYTES {
+        return;
+    }
+    let rotated = rotated_path(path);
+    if let Err(e) = std::fs::rename(path, &rotated) {
+        log::error!("[events] failed to rotate {} to {}: {e}", path.display(), rotated.display());
+    }
+}
+
+fn rotated_path(path: &Path) -> PathBuf {
+    let mut rotated = path.as_os_str().to_os_string();
+    rotated.push(".1");
+    PathBuf::from(rotated)
 }
 
 /// RFC 3339 timestamp without pulling in a date/time crate beyond what's
@@ -145,6 +176,57 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.lines().count(), 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rotate_if_needed_leaves_small_files_alone() {
+        let path = std::env::temp_dir().join("dpi-lab-test-events-rotate-small.jsonl");
+        let rotated = rotated_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+        std::fs::write(&path, "{\"kind\":\"sni\"}\n").unwrap();
+
+        rotate_if_needed(&path);
+        assert!(path.exists());
+        assert!(!rotated.exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rotate_if_needed_moves_oversized_file_to_dot_1() {
+        let path = std::env::temp_dir().join("dpi-lab-test-events-rotate-big.jsonl");
+        let rotated = rotated_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+        // One big write past the threshold - cheaper than emitting millions
+        // of real small events to reach the same size.
+        std::fs::write(&path, vec![b'a'; (MAX_EVENTS_LOG_BYTES + 1) as usize]).unwrap();
+
+        rotate_if_needed(&path);
+        assert!(!path.exists()); // renamed away
+        assert!(rotated.exists());
+        assert_eq!(std::fs::metadata(&rotated).unwrap().len(), MAX_EVENTS_LOG_BYTES + 1);
+
+        let _ = std::fs::remove_file(&rotated);
+    }
+
+    #[test]
+    fn emit_after_rotation_starts_a_fresh_file() {
+        let path = std::env::temp_dir().join("dpi-lab-test-events-rotate-then-emit.jsonl");
+        let rotated = rotated_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+        std::fs::write(&path, vec![b'a'; (MAX_EVENTS_LOG_BYTES + 1) as usize]).unwrap();
+
+        let log = EventLog::new(Some(path.clone()));
+        log.emit("sni", "1.1.1.1".parse().unwrap(), "2.2.2.2".parse().unwrap(), 1, 2, "rotated-in");
+
+        assert!(rotated.exists()); // the old oversized content moved here
+        let fresh = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(fresh.lines().count(), 1); // not appended onto the old giant file
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
     }
 
     #[test]

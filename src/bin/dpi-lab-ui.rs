@@ -52,6 +52,7 @@ fn route(mut request: tiny_http::Request, method: &Method, path: &str, config_di
         (Method::Get, "/") => html_response(DASHBOARD_HTML),
         (Method::Get, "/api/config") => json_response(list_config_files(config_dir)),
         (Method::Get, "/api/events") => json_response(tail_events(events_log, 200)),
+        (Method::Get, "/api/stats") => json_response(daily_stats(events_log)),
         (Method::Get, p) if p.starts_with("/api/config/") => match sanitize_name(&p["/api/config/".len()..]) {
             Some(name) => read_config(config_dir, &name),
             None => bad_request("invalid config name"),
@@ -144,6 +145,36 @@ fn tail_events(path: &Path, n: usize) -> Value {
     let start = lines.len().saturating_sub(n);
     let events: Vec<Value> = lines[start..].iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
     Value::Array(events)
+}
+
+/// Aggregate every event (active file + the one rotated `.1` file if
+/// present, see events.rs's rotation) by (date, kind), returning
+/// `[{date, kind, count}, ...]` sorted by date then kind. The event's own
+/// `time` field is already RFC 3339 (`events.rs::humantime_now`) - the
+/// first 10 characters are the date, no date-parsing library needed.
+fn daily_stats(path: &Path) -> Value {
+    let mut counts: std::collections::BTreeMap<(String, String), u64> = std::collections::BTreeMap::new();
+    for file in [path.to_path_buf(), rotated_path(path)] {
+        let Ok(contents) = std::fs::read_to_string(&file) else { continue };
+        for line in contents.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(event) = serde_json::from_str::<Value>(line) else { continue };
+            let (Some(time), Some(kind)) = (event["time"].as_str(), event["kind"].as_str()) else { continue };
+            let Some(date) = time.get(..10) else { continue };
+            *counts.entry((date.to_string(), kind.to_string())).or_insert(0) += 1;
+        }
+    }
+    let rows: Vec<Value> = counts.into_iter().map(|((date, kind), count)| serde_json::json!({"date": date, "kind": kind, "count": count})).collect();
+    Value::Array(rows)
+}
+
+/// Same rotated-filename convention as `events.rs::rotated_path` -
+/// duplicated rather than shared (see this file's own top-of-file doc
+/// comment on why it doesn't depend on dpi-lab's modules) - one string
+/// concatenation, not worth the coupling either.
+fn rotated_path(path: &Path) -> PathBuf {
+    let mut rotated = path.as_os_str().to_os_string();
+    rotated.push(".1");
+    PathBuf::from(rotated)
 }
 
 fn json_header() -> Header {
@@ -261,6 +292,59 @@ mod tests {
 
         let v = tail_events(&path, 200);
         assert_eq!(v.as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn daily_stats_missing_file_is_empty_array() {
+        assert_eq!(daily_stats(Path::new("/nonexistent/events.jsonl")), Value::Array(vec![]));
+    }
+
+    #[test]
+    fn daily_stats_groups_by_date_and_kind() {
+        let path = std::env::temp_dir().join("dpi-lab-ui-test-stats.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let lines = "{\"time\":\"2026-08-08T10:00:00Z\",\"kind\":\"sni\"}\n\
+                     {\"time\":\"2026-08-08T11:00:00Z\",\"kind\":\"sni\"}\n\
+                     {\"time\":\"2026-08-08T12:00:00Z\",\"kind\":\"ja3\"}\n\
+                     {\"time\":\"2026-08-09T09:00:00Z\",\"kind\":\"sni\"}\n";
+        std::fs::write(&path, lines).unwrap();
+
+        let v = daily_stats(&path);
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 3); // (08, sni), (08, ja3), (09, sni)
+        let find = |date: &str, kind: &str| rows.iter().find(|r| r["date"] == date && r["kind"] == kind).map(|r| r["count"].as_u64().unwrap());
+        assert_eq!(find("2026-08-08", "sni"), Some(2));
+        assert_eq!(find("2026-08-08", "ja3"), Some(1));
+        assert_eq!(find("2026-08-09", "sni"), Some(1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn daily_stats_includes_the_rotated_file_too() {
+        let path = std::env::temp_dir().join("dpi-lab-ui-test-stats-rotated.jsonl");
+        let rotated = rotated_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+        std::fs::write(&path, "{\"time\":\"2026-08-08T10:00:00Z\",\"kind\":\"sni\"}\n").unwrap();
+        std::fs::write(&rotated, "{\"time\":\"2026-08-07T10:00:00Z\",\"kind\":\"sni\"}\n").unwrap();
+
+        let v = daily_stats(&path);
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+    }
+
+    #[test]
+    fn daily_stats_skips_malformed_and_incomplete_lines() {
+        let path = std::env::temp_dir().join("dpi-lab-ui-test-stats-malformed.jsonl");
+        std::fs::write(&path, "not json\n{\"time\":\"2026-08-08T10:00:00Z\"}\n{\"kind\":\"sni\"}\n{\"time\":\"2026-08-08T10:00:00Z\",\"kind\":\"sni\"}\n").unwrap();
+
+        let v = daily_stats(&path);
+        assert_eq!(v.as_array().unwrap().len(), 1); // only the one fully-valid line counted
         let _ = std::fs::remove_file(&path);
     }
 }

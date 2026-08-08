@@ -37,6 +37,12 @@
   <tbody id="events-body"></tbody>
 </table>
 
+<h2>History <span style="color:#666;font-weight:normal">(last 14 days, by kind - polls every 30s)</span></h2>
+<table id="stats">
+  <thead><tr><th>date</th><th>kind</th><th>count</th></tr></thead>
+  <tbody id="stats-body"></tbody>
+</table>
+
 <script>
 let currentFile = null;
 
@@ -113,9 +119,35 @@ async function pollEvents() {
   }
 }
 
+async function pollStats() {
+  try {
+    const res = await fetch('/api/stats');
+    const rows = await res.json();
+    const body = document.getElementById('stats-body');
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="3" class="empty">no history yet</td></tr>';
+      return;
+    }
+    // Most-recent-14-days first, newest date on top; date already sorts
+    // lexically since it's YYYY-MM-DD.
+    const dates = [...new Set(rows.map(r => r.date))].sort().reverse().slice(0, 14);
+    const kept = rows.filter(r => dates.includes(r.date)).sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : a.kind.localeCompare(b.kind)));
+    body.innerHTML = kept.map(r => `
+      <tr>
+        <td>${r.date}</td>
+        <td class="kind">${r.kind}</td>
+        <td>${r.count}</td>
+      </tr>`).join('');
+  } catch (e) {
+    // transient fetch failure - next poll retries
+  }
+}
+
 loadFileList();
 pollEvents();
+pollStats();
 setInterval(pollEvents, 2000);
+setInterval(pollStats, 30000);
 </script>
 </body>
 </html>
