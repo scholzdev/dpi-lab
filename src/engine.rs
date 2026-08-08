@@ -99,6 +99,7 @@ struct FlowState {
     ip_checked: bool,
     cannon_fired: bool,
     handshake_checked: bool, // TCP-side structural handshake match (e.g. SSH banner), once per flow
+    host_checked: bool, // plaintext HTTP Host: header, once per flow - see classify::parse_http_host
 }
 
 pub struct Engine {
@@ -118,6 +119,8 @@ pub struct Engine {
     cannon_enabled: bool,
     lockdown_ips: Vec<(String, Instant)>, // deterministic pf-level blocks, see lockdown.rs
     lockdown_enabled: bool,
+    block_ech: bool,  // block on encrypted_client_hello presence alone - can't read SNI to filter by name
+    block_quic: bool, // force QUIC->TCP downgrade: blanket-drop UDP:443, see lockdown::build_ruleset
     trace: bool, // print every raw packet, not just classification/block events
     block_stats: BlockStats,
     escalation: HashMap<IpAddr, (u32, Instant)>, // offense count + window start, per source IP
@@ -140,6 +143,8 @@ impl Engine {
         cannon_enabled: bool,
         lockdown_ips: Vec<(String, Duration)>, // (ip, remaining TTL)
         lockdown_enabled: bool,
+        block_ech: bool,
+        block_quic: bool,
         trace: bool,
         block_stats: BlockStats,
     ) -> std::io::Result<Self> {
@@ -200,6 +205,12 @@ impl Engine {
         for (ip, d) in &lockdown_ips {
             println!("[lockdown] {ip} (expires in {}s)", d.as_secs());
         }
+        if block_ech {
+            println!("[block-ech] blocking on encrypted_client_hello presence alone (no SNI to name)");
+        }
+        if block_quic {
+            println!("[block-quic] blanket-dropping UDP:443 - QUIC forced to fall back to TCP+TLS");
+        }
         let now = Instant::now();
         let blocked_ip = blocked_ip.into_iter().map(|(ip, ttl)| (ip, ttl.map(|d| now + d))).collect();
         let lockdown_ips = lockdown_ips.into_iter().map(|(ip, d)| (ip, now + d)).collect();
@@ -220,6 +231,8 @@ impl Engine {
             cannon_enabled,
             lockdown_ips,
             lockdown_enabled,
+            block_ech,
+            block_quic,
             trace,
             block_stats,
             escalation: HashMap::new(),
@@ -281,7 +294,7 @@ impl Engine {
         self.lockdown_ips.retain(|(_, exp)| now < *exp);
         if self.lockdown_ips.len() != before {
             let ips: Vec<String> = self.lockdown_ips.iter().map(|(ip, _)| ip.clone()).collect();
-            if let Err(e) = lockdown::apply_all(&ips) {
+            if let Err(e) = lockdown::apply_all(&ips, self.block_quic) {
                 eprintln!("[lockdown] failed to update firewall rules after expiry: {e}");
             }
             println!("  [lockdown] expired entries removed, firewall rules updated");
@@ -323,6 +336,7 @@ impl Engine {
                 ip_checked: false,
                 cannon_fired: false,
                 handshake_checked: false,
+                host_checked: false,
             }
         });
 
@@ -356,7 +370,7 @@ impl Engine {
                 println!("  [ip] blocked flow {src}:{sport} -> {dst}:{dport}");
                 block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ip", "");
                 if self.lockdown_enabled {
-                    lockdown_on_match(&mut self.lockdown_ips, src, "ip");
+                    lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "ip");
                 }
             }
         }
@@ -369,7 +383,7 @@ impl Engine {
             println!("  [signature] {hit} in {src}:{sport} -> {dst}:{dport}");
             block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "signature", hit);
             if self.lockdown_enabled {
-                lockdown_on_match(&mut self.lockdown_ips, src, "signature");
+                lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "signature");
             }
         }
         state.sig_scanned_len = state.stream.delivered.len();
@@ -389,7 +403,7 @@ impl Engine {
                 println!("  [detect] {} on {src}:{sport} -> {dst}:{dport}", rule.name);
                 state.handshake_checked = true;
                 if self.lockdown_enabled {
-                    lockdown_on_match(&mut self.lockdown_ips, src, &rule.name);
+                    lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, &rule.name);
                 }
                 if self.inject_on_detect {
                     block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "handshake", &rule.name);
@@ -414,16 +428,33 @@ impl Engine {
                     if self.blocked_ja3.iter().any(|h| h == &hash) {
                         block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ja3", &hash);
                         if self.lockdown_enabled {
-                            lockdown_on_match(&mut self.lockdown_ips, src, "ja3");
+                            lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja3");
                         }
                     }
                 }
-                if let Some(name) = ch.sni {
+                if ch.has_ech {
+                    // ECH's outer ClientHello almost always still carries a
+                    // plaintext SNI extension - the public "cover" name (e.g.
+                    // Cloudflare's cover.defo.ie), not the real destination
+                    // hidden inside the encrypted inner hello. Trusting that
+                    // outer name would silently defeat the whole point of
+                    // blocking ECH, so this branch fires on has_ech alone,
+                    // unconditionally - it does NOT fall through to the SNI
+                    // branch below even when ch.sni is Some.
+                    let outer = ch.sni.as_deref().unwrap_or("none");
+                    println!("  [ech] {src}:{sport} -> {dst}:{dport}  encrypted_client_hello present, outer/cover sni={outer} (real destination hidden)");
+                    if self.block_ech {
+                        block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "ech", outer);
+                        if self.lockdown_enabled {
+                            lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ech");
+                        }
+                    }
+                } else if let Some(name) = ch.sni {
                     println!("  [sni] {src}:{sport} -> {dst}:{dport}  server_name={name}");
                     if self.blocked_sni.iter().any(|s| s == &name) {
                         block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "sni", &name);
                         if self.lockdown_enabled {
-                            lockdown_on_match(&mut self.lockdown_ips, src, "sni");
+                            lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "sni");
                         }
                     }
                     state.sni = Some(name);
@@ -450,11 +481,31 @@ impl Engine {
                     if self.inject_on_detect && confirmed {
                         block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "detect", label);
                         if self.lockdown_enabled {
-                            lockdown_on_match(&mut self.lockdown_ips, src, "detect");
+                            lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "detect");
                         }
                     }
                 }
                 state.checked_entropy = true;
+            }
+        }
+
+        // Plaintext HTTP has no SNI to filter on, but names its destination in
+        // the clear via the Host: header - the GFW has always inspected this
+        // too, not just TLS. Scanned once per flow against the reassembled
+        // buffer, same reasoning as the ClientHello retry above (Host header
+        // could in principle split across segments).
+        if !state.host_checked && !state.stream.delivered.is_empty() {
+            if let Some(name) = classify::parse_http_host(&state.stream.delivered) {
+                println!("  [host] {src}:{sport} -> {dst}:{dport}  host={name}");
+                if self.blocked_sni.iter().any(|s| s == &name) {
+                    block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "host", &name);
+                    if self.lockdown_enabled {
+                        lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "host");
+                    }
+                }
+                state.host_checked = true;
+            } else if state.stream.delivered.len() >= CLIENTHELLO_CAP {
+                state.host_checked = true; // give up - not a plaintext HTTP request
             }
         }
 
@@ -509,6 +560,27 @@ impl Engine {
             if let Some(name) = parse_dns_query_full(payload).map(|q| q.name) {
                 println!("  [dns] {src}:{sport} -> {dst}:{dport}  query={name}");
             }
+        } else if dport == 443 || sport == 443 {
+            // QUIC Initial packets are decryptable without keys - RFC 9001 §5.2
+            // derives them from a public salt, not the real handshake secret.
+            // See quic.rs. Everything past the Initial (Handshake, 1-RTT/app
+            // data) stays opaque, same blind spot as post-handshake TCP TLS.
+            if let Some(record) = crate::quic::decrypt_initial_client_hello_record(payload) {
+                if let Some((ja3_string, hash)) = ja3(&record) {
+                    println!("  [quic-ja3] {src}:{sport} -> {dst}:{dport}  ja3={hash} ({ja3_string})");
+                    if self.blocked_ja3.iter().any(|h| h == &hash) {
+                        if self.lockdown_enabled {
+                            lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "ja3");
+                        }
+                    }
+                }
+                if let Some(name) = classify::parse_sni(&record) {
+                    println!("  [quic-sni] {src}:{sport} -> {dst}:{dport}  server_name={name}");
+                    if self.blocked_sni.iter().any(|s| s == &name) && self.lockdown_enabled {
+                        lockdown_on_match(&mut self.lockdown_ips, self.block_quic, dst, "sni");
+                    }
+                }
+            }
         } else if let Some(rule) = self
             .handshake_rules
             .iter()
@@ -526,7 +598,7 @@ impl Engine {
             // protocol-agnostic) does.
             println!("  [detect] {} on {src}:{sport} -> {dst}:{dport}", rule.name);
             if self.lockdown_enabled {
-                lockdown_on_match(&mut self.lockdown_ips, src, &rule.name);
+                lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, &rule.name);
             }
         }
         if self.trace {
@@ -609,14 +681,14 @@ fn block(
 /// down at the pf level immediately, independent of whether the RST race
 /// above fired or even ran (lockdown doesn't need --inject's raw socket at
 /// all) - a deterministic kernel drop rather than a raced packet.
-fn lockdown_on_match(lockdown_ips: &mut Vec<(String, Instant)>, src: IpAddr, kind: &str) {
+fn lockdown_on_match(lockdown_ips: &mut Vec<(String, Instant)>, block_quic: bool, src: IpAddr, kind: &str) {
     let src_s = src.to_string();
     if lockdown_ips.iter().any(|(ip, _)| ip == &src_s) {
         return; // already locked down
     }
     lockdown_ips.push((src_s.clone(), Instant::now() + LOCKDOWN_TTL));
     let ips: Vec<String> = lockdown_ips.iter().map(|(ip, _)| ip.clone()).collect();
-    if let Err(e) = lockdown::apply_all(&ips) {
+    if let Err(e) = lockdown::apply_all(&ips, block_quic) {
         eprintln!("  [lockdown] failed to apply firewall rule for {src_s}: {e}");
         lockdown_ips.pop(); // roll back - firewall state and our list must agree
         return;
@@ -637,7 +709,7 @@ mod tests {
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
-        ], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, Arc::new(Mutex::new(HashMap::new())))
+        ], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
         .unwrap();
         std::thread::sleep(Duration::from_millis(5)); // let the zero-TTL entry actually pass
         engine.prune_expired_ips();

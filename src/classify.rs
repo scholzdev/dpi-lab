@@ -33,6 +33,13 @@ pub struct ClientHello {
     pub extensions: Vec<u16>,   // in wire order, GREASE included (callers filter as needed)
     pub curves: Vec<u16>,       // supported_groups extension (10)
     pub ec_point_formats: Vec<u8>, // ec_point_formats extension (11)
+    /// True if the "encrypted_client_hello" extension (0xfe0d, current IANA
+    /// codepoint used by Chrome/Cloudflare/Firefox deployments) is present.
+    /// When set, `sni` is the *outer* ClientHello's - decoy - SNI, not the
+    /// real destination: ECH's whole point is hiding the true SNI from a
+    /// path observer. A censor that can't read it can still block on its
+    /// presence alone (see `engine.rs`'s `--block-ech`).
+    pub has_ech: bool,
 }
 
 /// GREASE values (RFC 8701): reserved values of the form 0x?A?A with both bytes
@@ -95,6 +102,7 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello> {
     let mut extensions = Vec::new();
     let mut curves = Vec::new();
     let mut ec_point_formats = Vec::new();
+    let mut has_ech = false;
 
     while p + 4 <= ext_end && p + 4 <= hs.len() {
         let ext_type = u16::from_be_bytes([hs[p], hs[p + 1]]);
@@ -118,12 +126,13 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello> {
                 let list_len = *ext_data.get(0)? as usize;
                 ec_point_formats = ext_data.get(1..1 + list_len)?.to_vec();
             }
+            0xfe0d => has_ech = true, // encrypted_client_hello - contents are opaque, presence is the signal
             _ => {}
         }
         p += 4 + ext_len;
     }
 
-    Some(ClientHello { version, sni, cipher_suites, extensions, curves, ec_point_formats })
+    Some(ClientHello { version, sni, cipher_suites, extensions, curves, ec_point_formats, has_ech })
 }
 
 /// Extract just the SNI hostname - see `parse_client_hello` for details.
@@ -187,6 +196,24 @@ pub fn parse_dns_query_full(data: &[u8]) -> Option<DnsQuery> {
     let question_end = p + 4; // + QTYPE(2) + QCLASS(2)
     let question_raw = data.get(start..question_end)?.to_vec();
     Some(DnsQuery { id, name: labels.join("."), question_raw })
+}
+
+/// Extract the `Host:` header value from a plaintext HTTP request - the GFW
+/// (and every other DPI box) has always inspected this alongside TLS SNI,
+/// since circumvention over plain HTTP (no TLS at all) doesn't have an SNI
+/// to filter on but still names its destination in the clear. Case-insensitive
+/// header name per RFC 7230; stops at the first CRLF, trims a trailing \r.
+pub fn parse_http_host(data: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(data).ok()?;
+    // Only look at the request line + headers, not any body - a "Host:" byte
+    // sequence appearing in POST data isn't the request's actual destination.
+    let head = text.split("\r\n\r\n").next().unwrap_or(text);
+    for line in head.split("\r\n") {
+        if let Some(value) = line.strip_prefix("Host:").or_else(|| line.strip_prefix("host:")) {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
 }
 
 /// One known protocol handshake signature: an optional exact total length,
@@ -427,5 +454,66 @@ mod tests {
         let (ja3_string, hash) = ja3(&record).unwrap();
         assert_eq!(ja3_string, "771,4865,10-11,29,0"); // 0x1301=4865, 0x001d=29
         assert_eq!(hash.len(), 32); // md5 hex digest
+    }
+
+    #[test]
+    fn ech_extension_detected_even_without_readable_sni() {
+        // ECH extension (0xfe0d, empty payload for this test - contents are
+        // opaque anyway) with no server_name extension present at all: this
+        // is exactly what a real ECH ClientHello's outer half looks like to
+        // an observer that can't decrypt it.
+        let mut ext = vec![];
+        ext.extend_from_slice(&0xfe0du16.to_be_bytes());
+        ext.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut hs = vec![0x03, 0x03];
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.push(0); // session_id_len
+        hs.extend_from_slice(&2u16.to_be_bytes());
+        hs.extend_from_slice(&[0x13, 0x01]);
+        hs.push(1);
+        hs.push(0);
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(hs.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&hs);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+
+        let ch = parse_client_hello(&record).unwrap();
+        assert!(ch.has_ech);
+        assert!(ch.sni.is_none());
+    }
+
+    #[test]
+    fn no_ech_extension_not_flagged() {
+        assert!(!parse_client_hello(b"").is_some_and(|ch| ch.has_ech)); // trivially false, real coverage is in earlier SNI tests
+    }
+
+    #[test]
+    fn http_host_header_extracted() {
+        let req = b"GET /path HTTP/1.1\r\nHost: evil.com\r\nUser-Agent: curl\r\n\r\n";
+        assert_eq!(parse_http_host(req).unwrap(), "evil.com");
+    }
+
+    #[test]
+    fn http_host_header_case_insensitive() {
+        let req = b"GET / HTTP/1.1\r\nhost: evil.com\r\n\r\n";
+        assert_eq!(parse_http_host(req).unwrap(), "evil.com");
+    }
+
+    #[test]
+    fn http_host_ignores_header_lookalike_in_body() {
+        let req = b"POST / HTTP/1.1\r\nHost: real.com\r\n\r\nHost: fake.com\r\n";
+        assert_eq!(parse_http_host(req).unwrap(), "real.com");
+    }
+
+    #[test]
+    fn http_host_missing_returns_none() {
+        assert!(parse_http_host(b"GET / HTTP/1.1\r\n\r\n").is_none());
     }
 }

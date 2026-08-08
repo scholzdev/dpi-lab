@@ -1,8 +1,16 @@
 // Live capture -> engine pipeline (decode/reassemble/classify/inject/redirect).
 // Run: sudo ./target/debug/dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns] [--trace]
 //      [--block-sni <domain>]... [--block-ja3 <hash>]... [--block-ip <ip>]... [--block-sig <keyword>]...
+//      [--lockdown] [--block-ech] [--block-quic]
 // --trace prints every raw TCP/UDP packet (flood); without it, only
-// classification/block events ([sni] [ja3] [detect] [dns] [inject] [timing] [ip]) print.
+// classification/block events ([sni] [ja3] [host] [ech] [quic-sni] [quic-ja3]
+// [detect] [dns] [inject] [timing] [ip]) print. --block-ech requires --lockdown
+// to enforce (there's no SNI/hostname to RST-inject on, only presence to drop) -
+// blocks any ClientHello carrying the encrypted_client_hello extension outright,
+// since the real SNI inside it can't be read. --block-quic also requires
+// --lockdown: blanket-drops UDP:443 so QUIC clients fall back to inspectable
+// TCP+TLS instead of trying to selectively filter traffic dpi-lab can't decrypt
+// past the Initial packet (see quic.rs).
 // Block lists load from config/{sni,ja3,ip,signatures}.yml (plain YAML lists) and
 // config/redirect.yml (orig -> target mapping for --redirect-dns); CLI flags add to
 // whatever's in those files. Auto-escalated IPs persist to config/escalated_ip.yml
@@ -34,6 +42,7 @@ mod inject;
 mod inline;
 mod lockdown;
 mod probe;
+mod quic;
 mod reassembly;
 mod redirect;
 mod throttle;
@@ -155,6 +164,14 @@ fn main() {
     // unlike --inject's raced RST, this can't lose the race.
     let lockdown_enabled = args.iter().any(|a| a == "--lockdown");
     let trace = args.iter().any(|a| a == "--trace");
+    // ECH hides the real SNI from us entirely (RFC-in-progress "encrypted_client_hello",
+    // codepoint 0xfe0d) - can't selectively block by hostname, so block on the
+    // extension's mere presence instead. Requires --lockdown to actually enforce.
+    let block_ech = args.iter().any(|a| a == "--block-ech");
+    // QUIC is UDP - opaque to everything past the Initial packet (see quic.rs).
+    // Rather than let that opacity through, force a downgrade: drop all UDP:443
+    // so browsers fall back to TCP+TLS, where SNI/JA3 blocking already works.
+    let block_quic = args.iter().any(|a| a == "--block-quic");
 
     let config_dir = Path::new("config");
     let mut block_sni = config::load_list(&config_dir.join("sni.yml"));
@@ -196,8 +213,11 @@ fn main() {
             (exp > now_epoch).then(|| (ip, std::time::Duration::from_secs(exp - now_epoch)))
         }).collect();
     if lockdown_enabled {
+        if let Err(e) = lockdown::ensure_hooked() {
+            eprintln!("[lockdown] failed to hook anchor into main ruleset - blocks will not take effect: {e}");
+        }
         let ips: Vec<String> = lockdown_ips.iter().map(|(ip, _)| ip.clone()).collect();
-        if let Err(e) = lockdown::apply_all(&ips) {
+        if let Err(e) = lockdown::apply_all(&ips, block_quic) {
             eprintln!("[lockdown] failed to restore firewall rules at startup: {e}");
         }
     }
@@ -221,6 +241,8 @@ fn main() {
         cannon_enabled,
         lockdown_ips,
         lockdown_enabled,
+        block_ech,
+        block_quic,
         trace,
         block_stats,
     )
