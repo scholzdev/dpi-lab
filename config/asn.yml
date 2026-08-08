@@ -1,0 +1,11 @@
+# --block-asn <num> blocks every flow whose src/dst IP falls in one of that
+# ASN's ranges here. No bundled MaxMind/RIR database (licensing) - these are
+# documented example ranges only, not a real deployment's actual ASN table.
+# Real deployment: export your own ASN data source (MaxMind GeoLite2-ASN,
+# a RIR delegation file, bgp.he.net, etc.) into this flat shape.
+- cidr: 192.0.2.0/24
+  asn: 64500
+  name: "TEST-NET-1 (RFC 5737 documentation range, not a real ASN)"
+- cidr: 198.51.100.0/24
+  asn: 64501
+  name: "TEST-NET-2 (RFC 5737 documentation range, not a real ASN)"

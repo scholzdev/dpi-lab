@@ -1,10 +1,13 @@
 // Live capture -> engine pipeline (decode/reassemble/classify/inject/redirect).
 // Run: sudo ./target/debug/dpi-lab <interface> [--inject] [--inject-on-detect] [--redirect-dns] [--trace]
 //      [--block-sni <domain>]... [--block-ja3 <hash>]... [--block-ip <ip>]... [--block-sig <keyword>]...
-//      [--lockdown] [--block-ech] [--block-quic] [--allowlist-only]
+//      [--lockdown] [--block-ech] [--block-quic] [--allowlist-only] [--block-asn <num>]...
 // --allowlist-only: default-deny mode - block every flow whose src/dst isn't
 // in config/allowlist.yml (IP/CIDR), ignoring block_ip/sni/ja3/etc entirely.
 // Empty allowlist.yml + this flag blocks everything (fail-closed).
+// --block-asn: block every flow whose src/dst IP resolves (via config/asn.yml's
+// {cidr, asn, name} ranges - see asn.rs) to one of the given ASNs. No bundled
+// ASN database; config/asn.yml ships documented example ranges only.
 // --trace prints every raw TCP/UDP packet (flood); without it, only
 // classification/block events ([sni] [ja3] [host] [ech] [quic-sni] [quic-ja3]
 // [detect] [dns] [inject] [timing] [ip]) print. --block-ech requires --lockdown
@@ -36,6 +39,7 @@
 // Run as: sudo ./target/debug/dpi-lab --inline (no interface arg - nftables
 // picks up FORWARD traffic directly, this machine must be the actual gateway).
 // (no arg = list interfaces)
+mod asn;
 mod cannon;
 mod classify;
 mod config;
@@ -209,6 +213,10 @@ fn main() {
     let cannon = config::load_cannon_config(&config_dir.join("cannon.yml"));
     // Only meaningful with --allowlist-only; empty otherwise (nothing to check against).
     let allowlist = config::load_list(&config_dir.join("allowlist.yml"));
+    // ASN blocking: --block-asn AS_NUMBER (repeatable), resolved against
+    // config/asn.yml's {cidr, asn, name} ranges - see asn.rs.
+    let asn_ranges = config::load_asn_ranges(&config_dir.join("asn.yml"));
+    let blocked_asn: Vec<u32> = flag_values(&args, "--block-asn").into_iter().filter_map(|s| s.parse().ok()).collect();
     // Same ip -> number shape as the escalated-block expiry map, just reused
     // here for kbit/s instead of a unix timestamp.
     let throttle_entries: Vec<(String, u32)> =
@@ -245,6 +253,8 @@ fn main() {
         block_ip,
         allowlist,
         allowlist_only,
+        asn_ranges,
+        blocked_asn,
         signatures,
         handshake_rules,
         redirect_map,

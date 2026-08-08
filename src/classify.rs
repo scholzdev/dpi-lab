@@ -158,6 +158,98 @@ pub fn ja3(data: &[u8]) -> Option<(String, String)> {
     Some((ja3_string, format!("{digest:x}")))
 }
 
+/// Extract CN + SAN DNS names from a TLS <=1.2 Certificate handshake message
+/// (RFC 5246 §7.4.2) somewhere in a reassembled record stream. TLS 1.3 has no
+/// equivalent here - its Certificate message is encrypted under handshake
+/// traffic keys derived from the ECDHE exchange, which passive capture never
+/// has; this naturally returns None on a 1.3 flow rather than needing a
+/// version check, matching every other "try, return Option" parser here.
+/// Gives up (returns None) if the Certificate message or the record carrying
+/// it hasn't fully arrived yet, or spans more than one TLS record - real
+/// cert chains almost always fit in one, the rare exception isn't chased
+/// (see example.md's known limits).
+pub fn parse_tls_certificate_names(data: &[u8]) -> Option<Vec<String>> {
+    let mut offset = 0;
+    while offset + 5 <= data.len() {
+        let record_type = data[offset];
+        let record_len = u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
+        let record_start = offset + 5;
+        if record_start + record_len > data.len() {
+            return None; // record not fully delivered yet
+        }
+        if record_type == 0x16 {
+            if let Some(names) = parse_certificate_handshake(&data[record_start..record_start + record_len]) {
+                return Some(names);
+            }
+        }
+        offset = record_start + record_len;
+    }
+    None
+}
+
+/// Walk handshake messages within one TLS record looking for a Certificate
+/// message (type 0x0b) - a record commonly carries several handshake
+/// messages back to back (e.g. ServerHello immediately followed by
+/// Certificate), not just one.
+fn parse_certificate_handshake(record: &[u8]) -> Option<Vec<String>> {
+    let mut offset = 0;
+    while offset + 4 <= record.len() {
+        let msg_type = record[offset];
+        let hs_len = u32::from_be_bytes([0, record[offset + 1], record[offset + 2], record[offset + 3]]) as usize;
+        let body_start = offset + 4;
+        if body_start + hs_len > record.len() {
+            return None; // this handshake message spans records - give up
+        }
+        if msg_type == 0x0b {
+            return parse_certificate_body(&record[body_start..body_start + hs_len]);
+        }
+        offset = body_start + hs_len;
+    }
+    None
+}
+
+/// Certificate message body (RFC 5246 §7.4.2): a 3-byte total-length prefix
+/// followed by a list of (3-byte length, DER cert) entries. Only the first
+/// (leaf) certificate is parsed - that's the one naming the actual server.
+fn parse_certificate_body(body: &[u8]) -> Option<Vec<String>> {
+    if body.len() < 6 {
+        return None; // 3-byte list length + at least one 3-byte cert length
+    }
+    let cert_len = u32::from_be_bytes([0, body[3], body[4], body[5]]) as usize;
+    let cert_start = 6;
+    if cert_start + cert_len > body.len() {
+        return None;
+    }
+    names_from_der(&body[cert_start..cert_start + cert_len])
+}
+
+/// CN (subject) + SAN DNS names from a DER-encoded X.509 certificate.
+fn names_from_der(der: &[u8]) -> Option<Vec<String>> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    let mut names: Vec<String> = Vec::new();
+    for cn in cert.subject().iter_common_name() {
+        if let Ok(s) = cn.as_str() {
+            names.push(s.to_string());
+        }
+    }
+    for ext in cert.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+            for name in &san.general_names {
+                if let GeneralName::DNSName(dns) = name {
+                    names.push(dns.to_string());
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        names.dedup();
+        Some(names)
+    }
+}
+
 /// A parsed DNS message's transaction ID, queried name, and the raw question-section
 /// bytes (name + QTYPE + QCLASS) - the latter needed verbatim to build a spoofed
 /// response the client will accept as answering its own query.
@@ -339,6 +431,65 @@ mod tests {
         assert!(!rule_applies_to(&udp_only, "tcp"));
         assert!(rule_applies_to(&either, "udp"));
         assert!(rule_applies_to(&either, "tcp"));
+    }
+
+    #[test]
+    fn cert_parse_empty_data_returns_none() {
+        assert!(parse_tls_certificate_names(&[]).is_none());
+    }
+
+    #[test]
+    fn cert_parse_no_handshake_record_returns_none() {
+        // A record of some other type (e.g. application_data, 0x17) never gets walked.
+        let record = [0x17u8, 0x03, 0x03, 0x00, 0x01, 0xff];
+        assert!(parse_tls_certificate_names(&record).is_none());
+    }
+
+    #[test]
+    fn cert_parse_truncated_record_returns_none() {
+        // Record header claims 100 bytes of body but only 1 is present.
+        let record = [0x16u8, 0x03, 0x03, 0x00, 0x64, 0xff];
+        assert!(parse_tls_certificate_names(&record).is_none());
+    }
+
+    #[test]
+    fn cert_parse_skips_non_certificate_handshake_messages() {
+        // A handshake record carrying a ServerHello (type 0x02) only - no
+        // Certificate message anywhere - must walk past it and return None,
+        // not mistake it for one.
+        let server_hello_body = vec![0u8; 40];
+        let mut hs_msg = vec![0x02u8]; // ServerHello
+        hs_msg.extend_from_slice(&(server_hello_body.len() as u32).to_be_bytes()[1..]); // 3-byte length
+        hs_msg.extend_from_slice(&server_hello_body);
+
+        let mut record = vec![0x16u8, 0x03, 0x03];
+        record.extend_from_slice(&(hs_msg.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs_msg);
+
+        assert!(parse_tls_certificate_names(&record).is_none());
+    }
+
+    #[test]
+    fn cert_parse_invalid_der_returns_none_not_panic() {
+        // Certificate message located correctly (type 0x0b, framing intact),
+        // but the "DER" bytes inside are garbage - must fail closed, not panic.
+        let garbage_der = vec![0xffu8; 20];
+        let mut cert_entry = vec![0u8, 0u8]; // 3-byte cert length, filled below
+        cert_entry = (garbage_der.len() as u32).to_be_bytes()[1..].to_vec();
+        cert_entry.extend_from_slice(&garbage_der);
+
+        let mut cert_body = (cert_entry.len() as u32).to_be_bytes()[1..].to_vec(); // cert_list total length
+        cert_body.extend_from_slice(&cert_entry);
+
+        let mut hs_msg = vec![0x0bu8]; // Certificate
+        hs_msg.extend_from_slice(&(cert_body.len() as u32).to_be_bytes()[1..]);
+        hs_msg.extend_from_slice(&cert_body);
+
+        let mut record = vec![0x16u8, 0x03, 0x03];
+        record.extend_from_slice(&(hs_msg.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs_msg);
+
+        assert!(parse_tls_certificate_names(&record).is_none());
     }
 
     #[test]

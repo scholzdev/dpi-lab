@@ -50,18 +50,26 @@ fn looks_like_http_request(payload: &[u8]) -> bool {
 /// True if `rule` matches `ip` - exact address, or (IPv4) a CIDR range.
 pub(crate) fn ip_rule_matches(rule: &str, ip: &IpAddr) -> bool {
     match rule.split_once('/') {
-        Some((base, bits)) => {
-            let (IpAddr::V4(ip4), Ok(base4), Ok(bits)) = (ip, base.parse::<Ipv4Addr>(), bits.parse::<u32>()) else {
-                return false;
-            };
-            if bits > 32 {
-                return false;
-            }
-            let mask = if bits == 0 { 0 } else { !0u32 << (32 - bits) };
-            u32::from(*ip4) & mask == u32::from(base4) & mask
-        }
+        Some(_) => cidr_contains(rule, ip),
         None => rule == ip.to_string(),
     }
+}
+
+/// IPv4 CIDR containment check (`"10.0.0.0/24"` matching), extracted out of
+/// `ip_rule_matches` so ASN range lookups (see asn.rs) reuse the exact same
+/// bit-mask math instead of a second, driftable copy. `cidr` without a `/`
+/// (or IPv6 `ip`) never matches - CIDR-only, unlike `ip_rule_matches` which
+/// also accepts a bare exact-IP rule.
+pub(crate) fn cidr_contains(cidr: &str, ip: &IpAddr) -> bool {
+    let Some((base, bits)) = cidr.split_once('/') else { return false };
+    let (IpAddr::V4(ip4), Ok(base4), Ok(bits)) = (ip, base.parse::<Ipv4Addr>(), bits.parse::<u32>()) else {
+        return false;
+    };
+    if bits > 32 {
+        return false;
+    }
+    let mask = if bits == 0 { 0 } else { !0u32 << (32 - bits) };
+    u32::from(*ip4) & mask == u32::from(base4) & mask
 }
 
 /// Block-event counter keyed by kind ("sni", "ja3", "ip", "signature",
@@ -113,6 +121,7 @@ struct FlowState {
     cannon_fired: bool,
     handshake_checked: bool, // TCP-side structural handshake match (e.g. SSH banner), once per flow
     host_checked: bool, // plaintext HTTP Host: header, once per flow - see classify::parse_http_host
+    cert_checked: bool, // TLS <=1.2 Certificate message CN/SAN, once per flow - see classify::parse_tls_certificate_names
     last_seen: Instant, // for idle eviction, see prune_idle_flows
     tls_segment_count: u32, // non-empty segments seen on a TLS-like port before ClientHello resolved
     fragmentation_flagged: bool, // single-shot, like checked_entropy - don't spam the log
@@ -133,6 +142,8 @@ pub struct Engine {
     blocked_ip: Vec<(String, Option<Instant>)>, // (ip, expiry) - None = permanent, Some = auto-escalated
     allowlist: Vec<String>, // IP/CIDR allow-list, only meaningful when allowlist_only is set
     allowlist_only: bool, // default-deny: block everything NOT on `allowlist`, ignoring blocked_ip entirely
+    asn_ranges: Vec<crate::asn::AsnRange>, // ip -> ASN lookup table, see config/asn.yml
+    blocked_asn: Vec<u32>,
     probe_targets: Vec<String>, // allow-list for active probing, see probe.rs
     cannon: CannonConfig, // response-injection allow-list + payload, see cannon.rs
     cannon_enabled: bool,
@@ -156,6 +167,8 @@ impl Engine {
         blocked_ip: Vec<(String, Option<Duration>)>, // (ip, remaining TTL); None = permanent
         allowlist: Vec<String>,
         allowlist_only: bool,
+        asn_ranges: Vec<crate::asn::AsnRange>,
+        blocked_asn: Vec<u32>,
         signatures: Vec<String>,
         handshake_rules: Vec<classify::HandshakeRule>,
         redirect_map: Vec<(String, String)>,
@@ -235,6 +248,9 @@ impl Engine {
         if allowlist_only {
             println!("[allowlist-only] default-deny mode: {} entries, everything else blocked", allowlist.len());
         }
+        for asn in &blocked_asn {
+            println!("[block-asn] AS{asn} ({} ranges loaded)", asn_ranges.len());
+        }
         let now = Instant::now();
         let blocked_ip = blocked_ip.into_iter().map(|(ip, ttl)| (ip, ttl.map(|d| now + d))).collect();
         let lockdown_ips = lockdown_ips.into_iter().map(|(ip, d)| (ip, now + d)).collect();
@@ -253,6 +269,8 @@ impl Engine {
             blocked_ip,
             allowlist,
             allowlist_only,
+            asn_ranges,
+            blocked_asn,
             probe_targets,
             cannon,
             cannon_enabled,
@@ -385,6 +403,7 @@ impl Engine {
                 cannon_fired: false,
                 handshake_checked: false,
                 host_checked: false,
+                cert_checked: false,
                 last_seen: Instant::now(),
                 tls_segment_count: 0,
                 fragmentation_flagged: false,
@@ -453,6 +472,17 @@ impl Engine {
                 block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "allowlist", "");
                 if self.lockdown_enabled {
                     lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "allowlist");
+                }
+            } else if !self.blocked_asn.is_empty() {
+                let hit = [src, dst].into_iter().find_map(|ip| {
+                    crate::asn::asn_for_ip(&self.asn_ranges, &ip).filter(|asn| self.blocked_asn.contains(asn)).map(|asn| (ip, asn))
+                });
+                if let Some((_, asn)) = hit {
+                    println!("  [asn] blocked flow {src}:{sport} -> {dst}:{dport} (AS{asn})");
+                    block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "asn", &asn.to_string());
+                    if self.lockdown_enabled {
+                        lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "asn");
+                    }
                 }
             }
         }
@@ -588,6 +618,29 @@ impl Engine {
                 state.host_checked = true;
             } else if state.stream.delivered.len() >= CLIENTHELLO_CAP {
                 state.host_checked = true; // give up - not a plaintext HTTP request
+            }
+        }
+
+        // TLS <=1.2 Certificate message: sent by the server, so on whichever
+        // flow direction happens to carry it (the server->client one) - no
+        // cross-flow correlation needed, this check runs per-flow same as
+        // everything else and simply finds nothing on the other direction.
+        // TLS 1.3 naturally never matches here (message is encrypted).
+        if !state.cert_checked && !state.stream.delivered.is_empty() {
+            if let Some(names) = classify::parse_tls_certificate_names(&state.stream.delivered) {
+                println!("  [cert] {src}:{sport} -> {dst}:{dport}  names={names:?}");
+                if names.iter().any(|n| self.blocked_sni.iter().any(|s| s == n)) {
+                    block(self.injector.as_mut(), &self.block_stats, &mut self.blocked_ip, &mut self.escalation, tcp, src, sport, dst, dport, payload, "cert", &names.join(","));
+                    if self.lockdown_enabled {
+                        lockdown_on_match(&mut self.lockdown_ips, self.block_quic, src, "cert");
+                    }
+                }
+                state.cert_checked = true;
+            } else if state.stream.delivered.len() >= CLIENTHELLO_CAP * 4 {
+                // Cert chains run bigger than a ClientHello - a wider cap
+                // before giving up, still bounded so a non-TLS flow doesn't
+                // get rescanned on every packet forever.
+                state.cert_checked = true;
             }
         }
 
@@ -813,7 +866,7 @@ mod tests {
             ("expired".to_string(), Some(Duration::from_secs(0))),
             ("still-blocked".to_string(), Some(Duration::from_secs(3600))),
             ("permanent".to_string(), None),
-        ], vec![], false, vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
+        ], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
         .unwrap();
         std::thread::sleep(Duration::from_millis(5)); // let the zero-TTL entry actually pass
         engine.prune_expired_ips();
@@ -823,7 +876,7 @@ mod tests {
 
     #[test]
     fn prune_idle_flows_drops_stale_entries() {
-        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
+        let mut engine = Engine::new(false, false, false, vec![], vec![], vec![], vec![], false, vec![], vec![], vec![], vec![], vec![], vec![], CannonConfig::default(), false, vec![], false, false, false, false, Arc::new(Mutex::new(HashMap::new())))
         .unwrap();
         let stale_key = ("10.0.0.1".parse().unwrap(), 1, "10.0.0.2".parse().unwrap(), 2);
         let fresh_key = ("10.0.0.3".parse().unwrap(), 3, "10.0.0.4".parse().unwrap(), 4);
@@ -838,6 +891,7 @@ mod tests {
             cannon_fired: false,
             handshake_checked: false,
             host_checked: false,
+                cert_checked: false,
             last_seen: Instant::now(),
             tls_segment_count: 0,
             fragmentation_flagged: false,
@@ -854,6 +908,7 @@ mod tests {
             cannon_fired: false,
             handshake_checked: false,
             host_checked: false,
+                cert_checked: false,
             last_seen: Instant::now(),
             tls_segment_count: 0,
             fragmentation_flagged: false,

@@ -107,6 +107,19 @@ pub fn load_handshake_rules(path: &Path) -> Vec<crate::classify::HandshakeRule> 
     }
 }
 
+/// Load config/asn.yml - a list of {cidr, asn, name} ranges (see asn.rs).
+/// Same missing/malformed handling as everything else here.
+pub fn load_asn_ranges(path: &Path) -> Vec<crate::asn::AsnRange> {
+    let Ok(contents) = std::fs::read_to_string(path) else { return Vec::new() };
+    match serde_yaml::from_str(&contents) {
+        Ok(ranges) => ranges,
+        Err(e) => {
+            eprintln!("[config] failed to parse {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +216,31 @@ mod tests {
     #[test]
     fn missing_handshake_rules_is_empty_list() {
         assert!(load_handshake_rules(Path::new("/nonexistent/handshakes.yml")).is_empty());
+    }
+
+    #[test]
+    fn loads_asn_ranges() {
+        let path = tempfile("loads_asn_ranges");
+        std::fs::write(&path, "- cidr: 10.27.0.0/24\n  asn: 64500\n  name: lab-net\n").unwrap();
+        let ranges = load_asn_ranges(&path);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].cidr, "10.27.0.0/24");
+        assert_eq!(ranges[0].asn, 64500);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_asn_ranges_is_empty_list() {
+        assert!(load_asn_ranges(Path::new("/nonexistent/asn.yml")).is_empty());
+    }
+
+    /// Regression guard on the shipped file, same reasoning as
+    /// real_handshakes_yml_parses_with_expected_rules.
+    #[test]
+    fn real_asn_yml_parses() {
+        let ranges = load_asn_ranges(Path::new("config/asn.yml"));
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].asn, 64500);
     }
 
     /// Regression guard on the actual shipped file, not a synthetic fixture -

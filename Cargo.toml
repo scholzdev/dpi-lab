@@ -12,6 +12,7 @@ serde_yaml = "0.9"
 ctrlc = "3"
 libc = "0.2"
 ring = "0.17"
+x509-parser = "0.16"
 
 # --inline (genuine NFQUEUE-based inline enforcement, see src/inline.rs) is
 # Linux-only - this dependency doesn't even get fetched/compiled on macOS.
