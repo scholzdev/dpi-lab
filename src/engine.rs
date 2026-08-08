@@ -819,7 +819,7 @@ impl Engine {
                 println!("  [dns] {src}:{sport} -> {dst}:{dport}  query={}", query.name);
                 if let (Some((map, tx)), IpAddr::V4(dst4), IpAddr::V4(src4)) = (self.dns_redirect.as_mut(), dst, src) {
                     if let Some(&answer_ip) = map.get(&query.name) {
-                        match redirect::send_dns_redirect(tx, dst4, src4, sport, &query, answer_ip) {
+                        match redirect::send_dns_redirect_flood(tx, dst4, src4, sport, &query, answer_ip) {
                             Ok(()) => println!("  [redirect] spoofed A record {} -> {answer_ip}", query.name),
                             Err(e) => eprintln!("  [redirect] failed: {e}"),
                         }
@@ -827,7 +827,7 @@ impl Engine {
                 }
                 if let (Some((map, tx)), IpAddr::V6(dst6), IpAddr::V6(src6)) = (self.dns_redirect_v6.as_ref(), dst, src) {
                     if let Some(&answer_ip) = map.get(&query.name) {
-                        match redirect::send_dns_redirect_v6(tx, dst6, src6, sport, &query, answer_ip) {
+                        match redirect::send_dns_redirect_v6_flood(tx, dst6, src6, sport, &query, answer_ip) {
                             Ok(()) => println!("  [redirect] spoofed AAAA record {} -> {answer_ip}", query.name),
                             Err(e) => eprintln!("  [redirect] failed: {e}"),
                         }
